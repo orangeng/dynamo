@@ -86,10 +86,16 @@ pub struct MediaDecoder {
 #[pymethods]
 impl MediaDecoder {
     #[new]
-    fn new() -> Self {
-        Self {
+    fn new() -> PyResult<Self> {
+        #[cfg(not(feature = "media-nixl"))]
+        return Err(PyErr::new::<PyException, _>(
+            "--frontend-decoding not supported in this build. Remove the flag to use backend decoding.",
+        ));
+
+        #[cfg(feature = "media-nixl")]
+        Ok(Self {
             inner: RsMediaDecoder::default(),
-        }
+        })
     }
 
     fn image_decoder(&mut self, image_decoder: &Bound<'_, PyDict>) -> PyResult<()> {
@@ -110,11 +116,18 @@ pub struct MediaFetcher {
 #[pymethods]
 impl MediaFetcher {
     #[new]
-    fn new() -> Self {
-        Self {
+    fn new() -> PyResult<Self> {
+        #[cfg(not(feature = "media-nixl"))]
+        return Err(PyErr::new::<PyException, _>(
+            "--frontend-decoding not supported in this build. Remove the flag to use backend decoding.",
+        ));
+
+        #[cfg(feature = "media-nixl")]
+        Ok(Self {
             inner: RsMediaFetcher::default(),
-        }
+        })
     }
+
     fn user_agent(&mut self, user_agent: String) {
         self.inner.user_agent = user_agent;
     }

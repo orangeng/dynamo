@@ -66,6 +66,7 @@ class Config:
     enable_multimodal: bool = False
     multimodal_encode_prefill_worker: bool = False
     mm_prompt_template: str = "USER: <image>\n<prompt> ASSISTANT:"
+    frontend_decoding: bool = False
     # dump config to file
     dump_config_to: Optional[str] = None
 
@@ -188,6 +189,16 @@ def parse_args() -> Config:
         ),
     )
     parser.add_argument(
+        "--frontend-decoding",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: Enable frontend decoding of multimodal images. "
+            "When enabled, images are decoded in the Rust frontend and transferred to the backend via NIXL RDMA. "
+            "Requires building Dynamo's Rust components with '--features media-nixl'. "
+            "Without this flag, images are decoded in the Python backend (default behavior)."
+        ),
+    )
+    parser.add_argument(
         "--store-kv",
         type=str,
         choices=["etcd", "file", "mem"],
@@ -301,6 +312,7 @@ def parse_args() -> Config:
     config.multimodal_encode_prefill_worker = args.multimodal_encode_prefill_worker
     config.enable_multimodal = args.enable_multimodal
     config.mm_prompt_template = args.mm_prompt_template
+    config.frontend_decoding = args.frontend_decoding
     config.store_kv = args.store_kv
     config.request_plane = args.request_plane
 

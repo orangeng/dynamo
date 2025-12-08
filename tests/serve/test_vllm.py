@@ -512,7 +512,7 @@ def test_multimodal_b64(request, runtime_services, predownload_models):
         script_name="agg_multimodal.sh",
         marks=[],  # markers at function-level
         model="Qwen/Qwen2.5-VL-7B-Instruct",
-        script_args=["--model", "Qwen/Qwen2.5-VL-7B-Instruct"],
+        script_args=["--model", "Qwen/Qwen2.5-VL-7B-Instruct", "--frontend-decoding"],
         delayed_start=0,
         timeout=360,
         request_payloads=[b64_payload],
