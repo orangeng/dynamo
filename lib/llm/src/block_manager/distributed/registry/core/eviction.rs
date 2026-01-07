@@ -279,7 +279,7 @@ where
 /// where newer sequence positions are less valuable for prefix matching.
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// let storage = RadixStorage::new();
 /// let evictable = PositionalEviction::new(storage, 1000);
 ///

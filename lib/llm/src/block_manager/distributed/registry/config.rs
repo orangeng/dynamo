@@ -8,7 +8,7 @@ use std::time::Duration;
 /// Hub configuration for the registry server.
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// let config = RegistryHubConfig {
 ///     capacity: 1_000_000,
 ///     query_addr: "tcp://*:5555".to_string(),
@@ -99,7 +99,7 @@ impl RegistryHubConfig {
 /// Client configuration for registry workers.
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// let config = RegistryClientConfig {
 ///     hub_query_addr: "tcp://leader:5555".to_string(),
 ///     hub_register_addr: "tcp://leader:5556".to_string(),

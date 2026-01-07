@@ -98,9 +98,7 @@ pub trait PositionalStorageKey: Eq + Hash + Clone + Send + Sync {
 /// - Natural grouping for positional data (e.g., sequence positions)
 ///
 /// # Example
-/// ```ignore
-/// use crate::block_manager::distributed::registry::core::storage::{RadixStorage, PositionalStorageKey, Storage};
-///
+/// ```text
 /// #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 /// struct MyKey { position: u64, hash: u64 }
 ///
