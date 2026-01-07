@@ -114,13 +114,43 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
     // Enabled when DYN_KVBM_OBJECT_BUCKET is set
     let use_obj = std::env::var("DYN_KVBM_OBJECT_BUCKET").is_ok();
     if use_obj {
+        // Lock to prevent race conditions when multiple workers initialize concurrently.
+        // We need to set env vars, have NIXL read them, then create the backend atomically.
+        static OBJ_BACKEND_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = OBJ_BACKEND_INIT_LOCK.lock().unwrap();
+
+        // Apply worker_id templating to bucket name before NIXL reads env vars
+        // This allows per-worker buckets like "kvcache-worker-{worker_id}" -> "kvcache-worker-0"
+        // SAFETY: set_var is unsafe due to potential data races with concurrent env access.
+        // We hold the OBJ_BACKEND_INIT_LOCK to ensure exclusive access during this section.
+        if let Ok(bucket_template) = std::env::var("DYN_KVBM_OBJECT_BUCKET") {
+            let templated_bucket = bucket_template.replace("{worker_id}", &worker_id.to_string());
+            unsafe {
+                std::env::set_var("AWS_DEFAULT_BUCKET", &templated_bucket);
+            }
+            tracing::info!(
+                worker_id = worker_id,
+                bucket = %templated_bucket,
+                "Set AWS_DEFAULT_BUCKET for NIXL OBJ backend"
+            );
+        }
+
+        // Also set endpoint if configured via DYN_KVBM_OBJECT_ENDPOINT
+        if let Ok(endpoint) = std::env::var("DYN_KVBM_OBJECT_ENDPOINT") {
+            unsafe {
+                std::env::set_var("AWS_ENDPOINT_OVERRIDE", &endpoint);
+            }
+            tracing::debug!(endpoint = %endpoint, "Set AWS_ENDPOINT_OVERRIDE for NIXL OBJ backend");
+        }
+
         match agent.get_plugin_params("OBJ") {
             Ok((_, obj_params)) => match agent.create_backend("OBJ", &obj_params) {
-                Ok(_) => tracing::info!("Created OBJ backend for object storage"),
-                Err(e) => tracing::warn!("Failed to create OBJ backend: {}", e),
+                Ok(_) => tracing::info!(worker_id = worker_id, "Created OBJ backend for object storage"),
+                Err(e) => tracing::warn!(worker_id = worker_id, error = %e, "Failed to create OBJ backend"),
             },
-            Err(e) => tracing::warn!("OBJ plugin not available: {}", e),
+            Err(e) => tracing::warn!(worker_id = worker_id, error = %e, "OBJ plugin not available"),
         }
+        // Lock released here when _guard drops
     }
 
     Ok(agent)
@@ -290,10 +320,28 @@ async fn perform_allocation_and_build_handler(
 
         // Create remote context if we have host blocks (for bounce buffers)
         let remote_context = if host_blocks.is_some() {
-            // Get bucket from environment variable
-            let bucket = std::env::var("AWS_DEFAULT_BUCKET").ok();
-            let endpoint = std::env::var("AWS_ENDPOINT_URL").ok();
-            let region = std::env::var("AWS_REGION").ok();
+            // Get bucket from environment variable, with worker_id templating support
+            // Supports {worker_id} placeholder, e.g. "kvcache-worker-{worker_id}" -> "kvcache-worker-0"
+            let bucket = std::env::var("DYN_KVBM_OBJECT_BUCKET")
+                .or_else(|_| std::env::var("AWS_DEFAULT_BUCKET"))
+                .ok()
+                .map(|b| b.replace("{worker_id}", &worker_id.to_string()));
+
+            let endpoint = std::env::var("DYN_KVBM_OBJECT_ENDPOINT")
+                .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+                .or_else(|_| std::env::var("AWS_ENDPOINT_OVERRIDE"))
+                .ok();
+
+            let region = std::env::var("DYN_KVBM_OBJECT_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .ok();
+
+            tracing::info!(
+                worker_id = worker_id,
+                bucket = ?bucket,
+                endpoint = ?endpoint,
+                "Creating remote context for object storage"
+            );
 
             Some(Arc::new(RemoteTransferContext::for_object_with_options(
                 transfer_context.clone(),

@@ -17,7 +17,8 @@
 //! let matched = handle.match_prefix(keys).await;
 //! ```
 
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +26,52 @@ use tokio::sync::{mpsc, oneshot};
 use crate::block_manager::distributed::registry::{
     Registry, RegistryKey, RegistryMetadata, RegistryValue,
 };
+
+/// Fallback runtime for sync operations when not in a Tokio context.
+/// This is used when `_blocking` methods are called from threads without a runtime
+/// (e.g., Python multiprocessing processes via PyO3).
+static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn get_fallback_runtime() -> &'static tokio::runtime::Runtime {
+    FALLBACK_RUNTIME.get_or_init(|| {
+        tracing::info!(
+            "RemoteHandle: creating fallback Tokio runtime (2 worker threads) for sync operations"
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("remote-handle-fallback")
+            .enable_all()
+            .build()
+            .expect("Failed to create fallback runtime for RemoteHandle")
+    })
+}
+
+/// Execute a future from synchronous code, using the current runtime if available,
+/// or a fallback runtime if not.
+fn block_on_with_fallback<F, R>(future: F) -> R
+where
+    F: Future<Output = R> + Send,
+    R: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // We're in a Tokio context - use block_in_place to avoid blocking worker threads
+            tracing::debug!(
+                "RemoteHandle: using current Tokio runtime (thread: {:?})",
+                std::thread::current().name()
+            );
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Err(_) => {
+            // No runtime on this thread - use the fallback runtime
+            tracing::debug!(
+                "RemoteHandle: using fallback runtime (thread: {:?})",
+                std::thread::current().name()
+            );
+            get_fallback_runtime().block_on(future)
+        }
+    }
+}
 
 /// Default timeout for registry operations.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -468,15 +515,13 @@ impl RemoteHashOperationsSync for PositionalRemoteHandle {
         let keys = hashes_to_positional_keys(hashes, worker_id);
         let handle = self.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                handle
-                    .match_prefix(keys)
-                    .await
-                    .into_iter()
-                    .map(|(key, _, _)| key.sequence_hash)
-                    .collect()
-            })
+        block_on_with_fallback(async move {
+            handle
+                .match_prefix(keys)
+                .await
+                .into_iter()
+                .map(|(key, _, _)| key.sequence_hash)
+                .collect()
         })
     }
 
@@ -499,10 +544,8 @@ impl RemoteHashOperationsSync for PositionalRemoteHandle {
 
         let handle = self.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                handle.register(reg_entries).await;
-            })
+        block_on_with_fallback(async move {
+            handle.register(reg_entries).await;
         });
     }
 
@@ -518,19 +561,17 @@ impl RemoteHashOperationsSync for PositionalRemoteHandle {
         let keys = hashes_to_positional_keys(hashes, worker_id);
         let handle = self.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let result = handle.can_offload(keys).await;
-                (
-                    result.can_offload.iter().map(|k| k.sequence_hash).collect(),
-                    result
-                        .already_stored
-                        .iter()
-                        .map(|k| k.sequence_hash)
-                        .collect(),
-                    result.leased.iter().map(|k| k.sequence_hash).collect(),
-                )
-            })
+        block_on_with_fallback(async move {
+            let result = handle.can_offload(keys).await;
+            (
+                result.can_offload.iter().map(|k| k.sequence_hash).collect(),
+                result
+                    .already_stored
+                    .iter()
+                    .map(|k| k.sequence_hash)
+                    .collect(),
+                result.leased.iter().map(|k| k.sequence_hash).collect(),
+            )
         })
     }
 }
