@@ -5,7 +5,7 @@ pub mod context;
 mod cuda;
 mod memcpy;
 mod nixl;
-mod remote;
+pub mod remote;
 mod strategy;
 
 use super::*;

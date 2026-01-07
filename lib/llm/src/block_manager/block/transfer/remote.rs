@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::TransferError;
+use crate::block_manager::distributed::registry::RegistryValue;
 
 /// Kind of remote storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -163,6 +164,72 @@ impl RemoteKey {
     /// Create disk key from sequence hash.
     pub fn disk_from_hash(path: impl Into<String>, hash: u64) -> Self {
         RemoteKey::Disk(DiskKey::from_hash(path, hash))
+    }
+}
+
+/// Binary format for RemoteKey:
+/// - Byte 0: variant tag (0 = Object, 1 = Disk)
+/// - Bytes 1-2: location length (u16 LE) - bucket for Object, path for Disk
+/// - Bytes 3..3+loc_len: location bytes
+/// - Bytes after location: 2 bytes for key length (u16 LE) + key bytes
+impl RegistryValue for RemoteKey {
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            RemoteKey::Object(obj) => {
+                let bucket_bytes = obj.bucket.as_bytes();
+                let key_bytes = obj.key.as_bytes();
+                let mut buf = Vec::with_capacity(1 + 2 + bucket_bytes.len() + 2 + key_bytes.len());
+                buf.push(0u8); // Object variant
+                buf.extend_from_slice(&(bucket_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bucket_bytes);
+                buf.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(key_bytes);
+                buf
+            }
+            RemoteKey::Disk(disk) => {
+                let path_bytes = disk.path.as_bytes();
+                let key_bytes = disk.key.as_bytes();
+                let mut buf = Vec::with_capacity(1 + 2 + path_bytes.len() + 2 + key_bytes.len());
+                buf.push(1u8); // Disk variant
+                buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(path_bytes);
+                buf.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(key_bytes);
+                buf
+            }
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 5 {
+            return None;
+        }
+        let variant = bytes[0];
+        let loc_len = u16::from_le_bytes(bytes[1..3].try_into().ok()?) as usize;
+        if bytes.len() < 3 + loc_len + 2 {
+            return None;
+        }
+        let location = String::from_utf8(bytes[3..3 + loc_len].to_vec()).ok()?;
+        let key_offset = 3 + loc_len;
+        let key_len =
+            u16::from_le_bytes(bytes[key_offset..key_offset + 2].try_into().ok()?) as usize;
+        if bytes.len() < key_offset + 2 + key_len {
+            return None;
+        }
+        let key =
+            String::from_utf8(bytes[key_offset + 2..key_offset + 2 + key_len].to_vec()).ok()?;
+
+        match variant {
+            0 => Some(RemoteKey::Object(ObjectKey {
+                bucket: location,
+                key,
+            })),
+            1 => Some(RemoteKey::Disk(DiskKey {
+                path: location,
+                key,
+            })),
+            _ => None,
+        }
     }
 }
 
@@ -376,6 +443,60 @@ impl RemoteTransferPipeline {
     pub fn num_blocks(&self) -> usize {
         self.descriptors().len()
     }
+
+    pub fn bounce_block_ids(&self) -> Option<&[usize]> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::WithBounce {
+                bounce_block_ids, ..
+            } => Some(bounce_block_ids),
+        }
+    }
+
+    pub fn device_block_ids(&self) -> Option<&[usize]> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::WithBounce {
+                device_block_ids, ..
+            } => Some(device_block_ids),
+        }
+    }
+
+    /// Execute the remote transfer using the provided context and local blocks.
+    ///
+    /// For transfers with bounce buffers, this executes the remote<->bounce transfer.
+    /// The bounce<->device transfer should be handled separately via the local transfer system.
+    pub async fn execute<LB>(
+        &self,
+        local_blocks: &[LB],
+        ctx: &crate::block_manager::config::RemoteTransferContext,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), TransferError>
+    where
+        LB: crate::block_manager::block::ReadableBlock
+            + crate::block_manager::block::WritableBlock
+            + crate::block_manager::storage::Local,
+        <LB as crate::block_manager::block::StorageTypeProvider>::StorageType:
+            nixl_sys::NixlDescriptor,
+    {
+        let descriptors = self.descriptors();
+        if descriptors.is_empty() {
+            return Ok(());
+        }
+
+        let direction = self.direction();
+        let kind = descriptors[0].kind();
+
+        super::nixl::execute_remote_transfer(
+            direction,
+            kind,
+            descriptors,
+            local_blocks,
+            ctx,
+            cancel_token,
+        )
+        .await
+    }
 }
 
 /// Strategy for remote transfers.
@@ -529,6 +650,27 @@ mod tests {
             ),
             RemoteTransferStrategy::NixlDiskWrite
         );
+    }
+
+    #[test]
+    fn test_remote_key_registry_value() {
+        // Test Object key roundtrip
+        let obj_key = RemoteKey::object("my-bucket", "path/to/object");
+        let bytes = obj_key.to_bytes();
+        let decoded = RemoteKey::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, obj_key);
+
+        // Test Disk key roundtrip
+        let disk_key = RemoteKey::disk("/mnt/storage", "block-001");
+        let bytes = disk_key.to_bytes();
+        let decoded = RemoteKey::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, disk_key);
+
+        // Test from_hash pattern
+        let hash_key = RemoteKey::object_from_hash("cache-bucket", 0x123456789ABCDEF0);
+        let bytes = hash_key.to_bytes();
+        let decoded = RemoteKey::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.sequence_hash(), Some(0x123456789ABCDEF0));
     }
 
     #[test]

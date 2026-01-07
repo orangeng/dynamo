@@ -202,6 +202,13 @@ where
                             let identity = frames[0].to_vec();
                             let data = frames[frames.len() - 1].to_vec();
 
+                            debug!(
+                                identity_len = identity.len(),
+                                data_len = data.len(),
+                                frames = frames.len(),
+                                "Query request received"
+                            );
+
                             let response = Self::handle_query(&storage, &codec, &data);
 
                             if tx.send((identity, response)).await.is_err() {
@@ -249,6 +256,13 @@ where
                 result = puller.next() => {
                     match result {
                         Some(Ok(msg)) => {
+                            let frame_count = msg.len();
+                            let total_bytes: usize = msg.iter().map(|f| f.len()).sum();
+                            debug!(
+                                frames = frame_count,
+                                total_bytes = total_bytes,
+                                "Registration request received"
+                            );
                             for frame in msg.iter() {
                                 Self::handle_registration(&storage, &codec, frame.as_ref());
                             }
@@ -290,13 +304,20 @@ where
                     })
                     .collect();
 
+                let granted_count = statuses
+                    .iter()
+                    .filter(|s| **s == OffloadStatus::Granted)
+                    .count();
+                let already_stored_count = statuses.len() - granted_count;
+
                 debug!(
-                    keys = keys.len(),
-                    granted = statuses
-                        .iter()
-                        .filter(|s| **s == OffloadStatus::Granted)
-                        .count(),
-                    "can_offload query"
+                    query_type = "CanOffload",
+                    keys = ?keys,
+                    keys_count = keys.len(),
+                    granted = granted_count,
+                    already_stored = already_stored_count,
+                    storage_size = storage.len(),
+                    "Query processed"
                 );
 
                 if let Err(e) =
@@ -312,9 +333,14 @@ where
                     .collect();
 
                 debug!(
+                    query_type = "Match",
+                    keys = ?keys,
                     requested = keys.len(),
                     matched = entries.len(),
-                    "match query"
+                    matched_keys = ?entries.iter().map(|(k, _, _)| k).collect::<Vec<_>>(),
+                    miss = keys.len() - entries.len(),
+                    storage_size = storage.len(),
+                    "Query processed"
                 );
 
                 if let Err(e) = codec.encode_response(&ResponseType::Match(entries), &mut response)
@@ -330,16 +356,36 @@ where
     /// Handle a registration message.
     fn handle_registration(storage: &S, codec: &C, data: &[u8]) {
         let Some(entries) = codec.decode_register(data) else {
-            warn!("Failed to decode registration");
+            warn!(data_len = data.len(), "Failed to decode registration");
             return;
         };
 
         let count = entries.len();
+        let prev_total = storage.len();
+
+        // Log each entry being registered
+        for (key, value, metadata) in &entries {
+            debug!(
+                key = ?key,
+                value = ?value,
+                metadata = ?metadata,
+                "Registering entry"
+            );
+        }
+
         for (key, value, _metadata) in entries {
             storage.insert(key, value);
         }
+        let new_total = storage.len();
 
-        debug!(count, total = storage.len(), "registration processed");
+        debug!(
+            entries_count = count,
+            prev_total = prev_total,
+            new_total = new_total,
+            added = new_total - prev_total,
+            data_bytes = data.len(),
+            "Registration batch processed"
+        );
     }
 }
 

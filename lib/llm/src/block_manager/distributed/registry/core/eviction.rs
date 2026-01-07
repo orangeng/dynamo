@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
-use super::storage::Storage;
+use super::storage::{PositionalStorageKey, RadixStorage, Storage};
 
 /// Eviction policy wrapping a storage backend.
 pub trait Eviction<K, V>: Storage<K, V> {
@@ -272,6 +272,172 @@ where
     }
 }
 
+/// Position-aware eviction for RadixStorage.
+///
+/// Evicts entries from highest positions first (tail of sequence),
+/// with FIFO ordering within each position. This is ideal for KV cache
+/// where newer sequence positions are less valuable for prefix matching.
+///
+/// # Example
+/// ```ignore
+/// let storage = RadixStorage::new();
+/// let evictable = PositionalEviction::new(storage, 1000);
+///
+/// // Insert entries at various positions
+/// evictable.insert(key_at_pos_0, value);
+/// evictable.insert(key_at_pos_100, value);
+///
+/// // Eviction will remove from position 100 first
+/// evictable.evict(1);
+/// ```
+pub struct PositionalEviction<K, V>
+where
+    K: PositionalStorageKey + Ord + Copy,
+    V: Clone + Send + Sync,
+{
+    inner: RadixStorage<K, V>,
+    capacity: usize,
+    /// Track insertion order within each position: position -> ordered keys
+    insertion_order: RwLock<HashMap<u64, Vec<K>>>,
+    /// Track which positions have entries, ordered by position (descending for eviction)
+    positions: RwLock<BTreeSet<std::cmp::Reverse<u64>>>,
+}
+
+impl<K, V> PositionalEviction<K, V>
+where
+    K: PositionalStorageKey + Ord + Copy + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    pub fn new(storage: RadixStorage<K, V>, capacity: usize) -> Self {
+        Self {
+            inner: storage,
+            capacity,
+            insertion_order: RwLock::new(HashMap::new()),
+            positions: RwLock::new(BTreeSet::new()),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::new(RadixStorage::new(), capacity)
+    }
+
+    fn maybe_evict(&self) {
+        while self.inner.len() > self.capacity {
+            if self.evict_one().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn evict_one(&self) -> Option<K> {
+        let mut positions = self.positions.write();
+        let mut insertion_order = self.insertion_order.write();
+
+        // Get highest position (due to Reverse wrapper, first() gives highest)
+        let highest_pos = positions.iter().next().map(|r| r.0)?;
+
+        // Get the first (oldest) key at this position
+        let keys = insertion_order.get_mut(&highest_pos)?;
+        if keys.is_empty() {
+            return None;
+        }
+
+        let key = keys.remove(0);
+
+        // If position is now empty, remove it from tracking
+        if keys.is_empty() {
+            insertion_order.remove(&highest_pos);
+            positions.remove(&std::cmp::Reverse(highest_pos));
+        }
+
+        drop(positions);
+        drop(insertion_order);
+
+        self.inner.remove(&key);
+        Some(key)
+    }
+}
+
+impl<K, V> Storage<K, V> for PositionalEviction<K, V>
+where
+    K: PositionalStorageKey + Ord + Copy + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn insert(&self, key: K, value: V) {
+        let position = key.position();
+
+        {
+            let mut positions = self.positions.write();
+            let mut insertion_order = self.insertion_order.write();
+
+            positions.insert(std::cmp::Reverse(position));
+            insertion_order.entry(position).or_default().push(key);
+        }
+
+        self.inner.insert(key, value);
+        self.maybe_evict();
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.inner.get(key)
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.inner.contains(key)
+    }
+
+    fn remove(&self, key: &K) -> Option<V> {
+        let position = key.position();
+
+        {
+            let mut positions = self.positions.write();
+            let mut insertion_order = self.insertion_order.write();
+
+            if let Some(keys) = insertion_order.get_mut(&position) {
+                keys.retain(|k| k != key);
+                if keys.is_empty() {
+                    insertion_order.remove(&position);
+                    positions.remove(&std::cmp::Reverse(position));
+                }
+            }
+        }
+
+        self.inner.remove(key)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn clear(&self) {
+        self.positions.write().clear();
+        self.insertion_order.write().clear();
+        self.inner.clear();
+    }
+}
+
+impl<K, V> Eviction<K, V> for PositionalEviction<K, V>
+where
+    K: PositionalStorageKey + Ord + Copy + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn evict(&self, count: usize) -> Vec<K> {
+        let mut evicted = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(key) = self.evict_one() {
+                evicted.push(key);
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +504,115 @@ mod tests {
 
         let evicted = evictable.evict(1);
         assert_eq!(evicted, vec![1]);
+    }
+
+    // PositionalEviction tests
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    struct TestPosKey {
+        position: u64,
+        id: u64,
+    }
+
+    impl PositionalStorageKey for TestPosKey {
+        fn position(&self) -> u64 {
+            self.position
+        }
+    }
+
+    #[test]
+    fn test_positional_eviction_basic() {
+        let evictable: PositionalEviction<TestPosKey, u64> = PositionalEviction::with_capacity(100);
+
+        let key1 = TestPosKey { position: 0, id: 1 };
+        let key2 = TestPosKey { position: 1, id: 2 };
+
+        evictable.insert(key1, 100);
+        evictable.insert(key2, 200);
+
+        assert_eq!(evictable.get(&key1), Some(100));
+        assert_eq!(evictable.get(&key2), Some(200));
+        assert_eq!(evictable.len(), 2);
+    }
+
+    #[test]
+    fn test_positional_eviction_evicts_highest_first() {
+        let evictable: PositionalEviction<TestPosKey, u64> = PositionalEviction::with_capacity(100);
+
+        // Insert at positions 0, 1, 2
+        let key0 = TestPosKey { position: 0, id: 1 };
+        let key1 = TestPosKey { position: 1, id: 2 };
+        let key2 = TestPosKey { position: 2, id: 3 };
+
+        evictable.insert(key0, 100);
+        evictable.insert(key1, 200);
+        evictable.insert(key2, 300);
+
+        // Evict should remove from position 2 first
+        let evicted = evictable.evict(1);
+        assert_eq!(evicted, vec![key2]);
+        assert_eq!(evictable.len(), 2);
+        assert!(evictable.contains(&key0));
+        assert!(evictable.contains(&key1));
+        assert!(!evictable.contains(&key2));
+
+        // Next eviction removes from position 1
+        let evicted = evictable.evict(1);
+        assert_eq!(evicted, vec![key1]);
+    }
+
+    #[test]
+    fn test_positional_eviction_fifo_within_position() {
+        let evictable: PositionalEviction<TestPosKey, u64> = PositionalEviction::with_capacity(100);
+
+        // Insert multiple keys at same position
+        let key1 = TestPosKey { position: 5, id: 1 };
+        let key2 = TestPosKey { position: 5, id: 2 };
+        let key3 = TestPosKey { position: 5, id: 3 };
+
+        evictable.insert(key1, 100);
+        evictable.insert(key2, 200);
+        evictable.insert(key3, 300);
+
+        // Should evict in FIFO order within position
+        let evicted = evictable.evict(2);
+        assert_eq!(evicted, vec![key1, key2]);
+        assert!(evictable.contains(&key3));
+    }
+
+    #[test]
+    fn test_positional_eviction_auto_evict_on_capacity() {
+        let evictable: PositionalEviction<TestPosKey, u64> = PositionalEviction::with_capacity(3);
+
+        // Insert 3 keys at increasing positions
+        for i in 0..3 {
+            evictable.insert(TestPosKey { position: i, id: i }, i);
+        }
+        assert_eq!(evictable.len(), 3);
+
+        // Insert 4th key - should auto-evict highest position (2)
+        evictable.insert(TestPosKey { position: 3, id: 3 }, 3);
+        assert_eq!(evictable.len(), 3);
+
+        // Position 3 was just inserted, so highest remaining after eviction of 3
+        // should still have pos 0, 1, and the new 3
+        assert!(evictable.contains(&TestPosKey { position: 0, id: 0 }));
+        assert!(evictable.contains(&TestPosKey { position: 1, id: 1 }));
+    }
+
+    #[test]
+    fn test_positional_eviction_remove() {
+        let evictable: PositionalEviction<TestPosKey, u64> = PositionalEviction::with_capacity(100);
+
+        let key1 = TestPosKey { position: 0, id: 1 };
+        let key2 = TestPosKey { position: 0, id: 2 };
+
+        evictable.insert(key1, 100);
+        evictable.insert(key2, 200);
+
+        evictable.remove(&key1);
+        assert_eq!(evictable.len(), 1);
+        assert!(!evictable.contains(&key1));
+        assert!(evictable.contains(&key2));
     }
 }

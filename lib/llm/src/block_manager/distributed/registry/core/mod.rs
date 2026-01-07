@@ -34,8 +34,8 @@ pub use error::{RegistryError, RegistryResult};
 pub use lease::{LeaseInfo, LeaseManager};
 
 // Storage & Eviction
-pub use eviction::{Eviction, NoEviction, TailEviction};
-pub use storage::{HashMapStorage, Storage};
+pub use eviction::{Eviction, NoEviction, PositionalEviction, TailEviction};
+pub use storage::{HashMapStorage, PositionalStorageKey, RadixStorage, Storage};
 
 // Key, Value, Metadata
 pub use key::{CompositeKey, Key128, PositionalKey, RegistryKey};
