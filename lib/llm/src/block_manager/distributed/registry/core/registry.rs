@@ -45,6 +45,11 @@ where
     async fn can_offload(&self, keys: &[K]) -> Result<OffloadResult<K>>;
     async fn match_prefix(&self, keys: &[K]) -> Result<Vec<(K, V, M)>>;
     async fn flush(&self) -> Result<()>;
+
+    /// Remove/invalidate entries from the registry by key.
+    /// Returns the number of entries that were removed.
+    /// This is used to clean up stale entries (e.g., when object storage returns NoSuchKey).
+    async fn remove(&self, keys: &[K]) -> Result<usize>;
 }
 
 /// Pending batch state.
@@ -273,6 +278,27 @@ where
         let mut buf = Vec::new();
         self.codec.encode_register(&entries, &mut buf)?;
         self.transport.publish(&buf).await
+    }
+
+    async fn remove(&self, keys: &[K]) -> Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut buf = Vec::new();
+        self.codec
+            .encode_query(&QueryType::Remove(keys.to_vec()), &mut buf)?;
+
+        let response = self.transport.request(&buf).await?;
+        let decoded = self
+            .codec
+            .decode_response(&response)
+            .ok_or_else(|| anyhow::anyhow!("invalid response"))?;
+
+        match decoded {
+            ResponseType::Remove(count) => Ok(count),
+            _ => Err(anyhow::anyhow!("unexpected response type for remove")),
+        }
     }
 }
 

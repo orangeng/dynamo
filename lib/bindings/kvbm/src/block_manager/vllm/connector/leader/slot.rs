@@ -397,6 +397,15 @@ pub struct VllmConnectorSlot {
     /// Total number of blocks queried from host/disk cache
     total_blocks_queried: usize,
 
+    /// Skip G4 (remote) lookup on retry after a failed onboard.
+    /// This prevents infinite retry loops when remote storage has stale registry entries.
+    skip_g4_on_retry: bool,
+
+    /// G4 hashes with their positions that were attempted but may have failed.
+    /// Used to invalidate stale registry entries when onboard fails.
+    /// Stores (sequence_hash, position) pairs where position is the index in the offloaded sequence.
+    attempted_g4_hashes: Option<Vec<(u64, u32)>>,
+
     /// Cache statistics tracker for this KVBM instance
     cache_stats: Arc<CacheStatsTracker>,
 
@@ -441,6 +450,8 @@ impl VllmConnectorSlot {
             tokens_cached_from_g4: 0,
             performed_cache_lookup: false,
             total_blocks_queried: 0,
+            skip_g4_on_retry: false,
+            attempted_g4_hashes: None,
             cache_stats,
             leader,
         }
@@ -522,6 +533,8 @@ impl Slot for VllmConnectorSlot {
         self.tokens_cached_from_g4 = 0;
         self.performed_cache_lookup = false;
         self.total_blocks_queried = 0;
+        self.skip_g4_on_retry = false;
+        self.attempted_g4_hashes = None;
     }
 
     fn reset(&mut self) {
@@ -862,6 +875,54 @@ impl Slot for VllmConnectorSlot {
             return Ok(());
         }
 
+        // Handle recovery from failed onboard - vLLM rescheduled the request
+        if matches!(self.state(), SlotState::Onboarding(_)) {
+            // Remove stale G4 hashes from registry to prevent other workers from hitting the same error
+            if let Some(stale_hash_positions) = self.attempted_g4_hashes.take() {
+                tracing::warn!(
+                    request_id = %self.request_id,
+                    num_stale_hashes = stale_hash_positions.len(),
+                    stale_hash_positions = ?stale_hash_positions,
+                    "G4 onboard failed - removing stale hashes from registry"
+                );
+
+                // Remove stale entries from the registry (fire-and-forget)
+                if let Some(handle) = self.leader.remote_handle() {
+                    let worker_id = self.leader.worker_id();
+                    handle.remove_hashes_with_positions_blocking(&stale_hash_positions, worker_id);
+                    tracing::info!(
+                        request_id = %self.request_id,
+                        num_removed = stale_hash_positions.len(),
+                        "Removed stale G4 hashes from registry"
+                    );
+                }
+            }
+
+            tracing::warn!(
+                request_id = %self.request_id,
+                state = ?self.state(),
+                "slot is in Onboarding state during acquire_local_matches; recovering from failed onboard - will skip G4 lookup on retry"
+            );
+            // Clean up any pending operations from the failed onboard
+            let _ = self.pending_operations.take();
+            // Reset slot state to allow retry - staging fields should already be None
+            // since trigger_onboarding consumed them with .take()
+            self.state = SlotState::Preempted;
+            self.iteration_first_scheduled = None;
+            self.current_position = 0;
+            self.evaluated_blocks = 0;
+            self.device_blocks.clear();
+            self.tokens_cached_from_device = 0;
+            self.tokens_cached_from_host = 0;
+            self.tokens_cached_from_disk = 0;
+            self.tokens_cached_from_g4 = 0;
+            self.performed_cache_lookup = false;
+            self.total_blocks_queried = 0;
+            // Skip G4 (remote) lookup on retry to prevent infinite loops
+            // when remote storage has stale registry entries (NoSuchKey errors)
+            self.skip_g4_on_retry = true;
+        }
+
         if !matches!(self.state(), SlotState::Initialized | SlotState::Preempted) {
             return Err(SlotError::InvalidOperation(format!(
                 "slot must be in the NotScheduled or Preempted state to acquire local matches; got {:?}",
@@ -950,9 +1011,15 @@ impl Slot for VllmConnectorSlot {
         let num_matched_disk_blocks = disk_blocks.len();
         self.record_cached_disk_tokens(num_matched_disk_blocks * block_size);
 
-        // Remote registry lookup
+        // Remote registry lookup (skip if recovering from failed G4 onboard to prevent infinite loops)
         let search_offset_g4 = search_offset + num_matched_disk_blocks;
-        let mut g4_hashes = if let Some(handle) = self.leader.remote_handle() {
+        let mut g4_hashes = if self.skip_g4_on_retry {
+            tracing::info!(
+                request_id = %self.request_id,
+                "Skipping G4 lookup due to previous onboard failure - will prefill from scratch"
+            );
+            vec![]
+        } else if let Some(handle) = self.leader.remote_handle() {
             let remaining_hashes = &sequence_hashes[search_offset_g4..];
             if !remaining_hashes.is_empty() {
                 let matched =
@@ -1117,6 +1184,16 @@ impl Slot for VllmConnectorSlot {
 
             debug_assert_eq!(dst_block_ids.len(), num_g4_blocks);
 
+            // Store hashes with positions for invalidation on failure
+            // Positions are 0, 1, 2... relative to the offloaded sequence (matching registration)
+            self.attempted_g4_hashes = Some(
+                g4_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &hash)| (hash, pos as u32))
+                    .collect(),
+            );
+
             // G4 onboard uses a different path - sends G4OnboardRequest to worker
             self.onboard_from_g4(g4_hashes, dst_block_ids)?;
 
@@ -1206,6 +1283,7 @@ impl VllmConnectorSlot {
             uuid: operation_id,
             transfer_type: TransferType::Store,
             request_type: RequestType::Scheduled,
+            block_ids: block_ids.to_vec(),
         };
 
         if let Err(e) = self.xfer_tx.send(xfer_req) {
@@ -1235,7 +1313,7 @@ impl VllmConnectorSlot {
         let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
             self.request_id.clone(),
             src_blocks,
-            dst_block_ids,
+            dst_block_ids.clone(),
             operation_id,
         ));
 
@@ -1244,6 +1322,7 @@ impl VllmConnectorSlot {
             uuid: operation_id,
             transfer_type: TransferType::Load,
             request_type: RequestType::Immediate,
+            block_ids: dst_block_ids,
         };
 
         if let Err(e) = self.xfer_tx.send(xfer_req) {
@@ -1293,7 +1372,7 @@ impl VllmConnectorSlot {
         let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::new_onboard(
             self.request_id.clone(),
             sequence_hashes,
-            device_block_ids,
+            device_block_ids.clone(),
             operation_id,
             self.block_size,
         ));
@@ -1303,6 +1382,7 @@ impl VllmConnectorSlot {
             uuid: operation_id,
             transfer_type: TransferType::Load,
             request_type: RequestType::Immediate,
+            block_ids: device_block_ids,
         };
 
         tracing::debug!(

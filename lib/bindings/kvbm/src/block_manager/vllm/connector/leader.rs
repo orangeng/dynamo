@@ -452,7 +452,10 @@ impl Leader for KvConnectorLeader {
             debug_assert!(
                 matches!(
                     slot.state(),
-                    SlotState::Initialized | SlotState::Onboarding(_)
+                    SlotState::Initialized
+                        | SlotState::Onboarding(_)
+                        | SlotState::OnboardStaged(_)
+                        | SlotState::Preempted
                 ),
                 "current slot state: {:?}",
                 slot.state()

@@ -149,6 +149,11 @@ pub struct WorkerTransferRequest {
     pub uuid: uuid::Uuid,
     pub transfer_type: TransferType,
     pub request_type: RequestType,
+
+    /// Block IDs for this transfer (for error tracking)
+    /// Uses serde(default) for backward compatibility - old messages without field will deserialize with empty vec.
+    #[serde(default)]
+    pub block_ids: Vec<usize>,
 }
 
 /// Sent by Worker to Scheduler.

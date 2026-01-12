@@ -348,6 +348,28 @@ where
                     warn!("Failed to encode response: {}", e);
                 }
             }
+            QueryType::Remove(keys) => {
+                let mut removed_count = 0usize;
+                for key in &keys {
+                    if storage.remove(key).is_some() {
+                        removed_count += 1;
+                    }
+                }
+
+                debug!(
+                    query_type = "Remove",
+                    keys = ?keys,
+                    requested = keys.len(),
+                    removed = removed_count,
+                    storage_size = storage.len(),
+                    "Query processed"
+                );
+
+                if let Err(e) = codec.encode_response(&ResponseType::Remove(removed_count), &mut response)
+                {
+                    warn!("Failed to encode response: {}", e);
+                }
+            }
         }
 
         response

@@ -127,6 +127,12 @@ pub enum RemoteOperation<K, V, M> {
     Flush {
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Remove stale entries from the registry.
+    Remove {
+        keys: Vec<K>,
+        /// Optional reply for confirmation (None = fire-and-forget).
+        reply: Option<oneshot::Sender<Result<usize, String>>>,
+    },
 }
 
 /// Handle for communicating with a registry task.
@@ -190,6 +196,12 @@ where
                 RemoteOperation::Flush { reply } => {
                     let result = Self::do_flush(&registry).await;
                     let _ = reply.send(result);
+                }
+                RemoteOperation::Remove { keys, reply } => {
+                    let result = Self::do_remove(&registry, keys).await;
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
                 }
             }
         }
@@ -272,6 +284,29 @@ where
     /// Flush pending registrations.
     async fn do_flush(registry: &Arc<dyn Registry<K, V, M> + Send + Sync>) -> Result<(), String> {
         registry.flush().await.map_err(|e| e.to_string())
+    }
+
+    /// Remove stale entries from the registry.
+    async fn do_remove(
+        registry: &Arc<dyn Registry<K, V, M> + Send + Sync>,
+        keys: Vec<K>,
+    ) -> Result<usize, String> {
+        match tokio::time::timeout(REGISTRY_TIMEOUT, registry.remove(&keys)).await {
+            Ok(Ok(count)) => {
+                tracing::info!(removed = count, requested = keys.len(), "Registry remove complete");
+                Ok(count)
+            }
+            Ok(Err(e)) => {
+                let msg = format!("Registry remove failed: {e}");
+                tracing::error!("{}", msg);
+                Err(msg)
+            }
+            Err(_) => {
+                let msg = "Registry remove timed out".to_string();
+                tracing::error!("{}", msg);
+                Err(msg)
+            }
+        }
     }
 
     /// Match keys by prefix - returns matching entries.
@@ -383,6 +418,49 @@ where
             .unwrap_or_else(|_| Err("Channel closed".to_string()))
     }
 
+    /// Remove stale entries - fire and forget.
+    pub async fn remove(&self, keys: Vec<K>) {
+        if keys.is_empty() {
+            return;
+        }
+
+        if self
+            .tx
+            .send(RemoteOperation::Remove {
+                keys,
+                reply: None,
+            })
+            .await
+            .is_err()
+        {
+            tracing::error!("RemoteHandle task has shut down");
+        }
+    }
+
+    /// Remove stale entries and wait for confirmation.
+    /// Returns the number of entries removed.
+    pub async fn remove_and_wait(&self, keys: Vec<K>) -> Result<usize, String> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let (tx, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(RemoteOperation::Remove {
+                keys,
+                reply: Some(tx),
+            })
+            .await
+            .is_err()
+        {
+            return Err("RemoteHandle task has shut down".to_string());
+        }
+
+        rx.await
+            .unwrap_or_else(|_| Err("Channel closed".to_string()))
+    }
+
     /// Check if the handle is still connected to the task.
     pub fn is_connected(&self) -> bool {
         !self.tx.is_closed()
@@ -413,6 +491,14 @@ pub trait RemoteHashOperations {
         hashes: &[u64],
         worker_id: u64,
     ) -> (Vec<u64>, Vec<u64>, Vec<u64>);
+
+    /// Remove stale hashes from the registry (fire-and-forget).
+    /// Used to clean up entries that point to non-existent data (e.g., NoSuchKey errors).
+    async fn remove_hashes(&self, hashes: &[u64], worker_id: u64);
+
+    /// Remove stale hashes from the registry with explicit positions (fire-and-forget).
+    /// This is more accurate than `remove_hashes` when the positions are known.
+    async fn remove_hashes_with_positions(&self, pairs: &[(u64, u32)], worker_id: u64);
 }
 
 #[async_trait::async_trait]
@@ -473,6 +559,24 @@ impl RemoteHashOperations for PositionalRemoteHandle {
             result.leased.iter().map(|k| k.sequence_hash).collect(),
         )
     }
+
+    async fn remove_hashes(&self, hashes: &[u64], worker_id: u64) {
+        if hashes.is_empty() {
+            return;
+        }
+
+        let keys = hashes_to_positional_keys(hashes, worker_id);
+        self.remove(keys).await;
+    }
+
+    async fn remove_hashes_with_positions(&self, pairs: &[(u64, u32)], worker_id: u64) {
+        if pairs.is_empty() {
+            return;
+        }
+
+        let keys = hash_position_pairs_to_keys(pairs, worker_id);
+        self.remove(keys).await;
+    }
 }
 
 /// Convert sequence hashes to positional keys.
@@ -484,6 +588,18 @@ fn hashes_to_positional_keys(hashes: &[u64], worker_id: u64) -> Vec<PositionalKe
             worker_id,
             sequence_hash: hash,
             position: pos as u32,
+        })
+        .collect()
+}
+
+/// Convert (hash, position) pairs to positional keys.
+fn hash_position_pairs_to_keys(pairs: &[(u64, u32)], worker_id: u64) -> Vec<PositionalKey> {
+    pairs
+        .iter()
+        .map(|&(hash, position)| PositionalKey {
+            worker_id,
+            sequence_hash: hash,
+            position,
         })
         .collect()
 }
@@ -504,6 +620,14 @@ pub trait RemoteHashOperationsSync {
         hashes: &[u64],
         worker_id: u64,
     ) -> (Vec<u64>, Vec<u64>, Vec<u64>);
+
+    /// Sync remove - blocks using `block_in_place`.
+    /// Used to remove stale entries that caused NoSuchKey errors.
+    fn remove_hashes_blocking(&self, hashes: &[u64], worker_id: u64);
+
+    /// Sync remove with explicit positions - blocks using `block_in_place`.
+    /// This is more accurate than `remove_hashes_blocking` when the positions are known.
+    fn remove_hashes_with_positions_blocking(&self, pairs: &[(u64, u32)], worker_id: u64);
 }
 
 impl RemoteHashOperationsSync for PositionalRemoteHandle {
@@ -573,6 +697,32 @@ impl RemoteHashOperationsSync for PositionalRemoteHandle {
                 result.leased.iter().map(|k| k.sequence_hash).collect(),
             )
         })
+    }
+
+    fn remove_hashes_blocking(&self, hashes: &[u64], worker_id: u64) {
+        if hashes.is_empty() {
+            return;
+        }
+
+        let keys = hashes_to_positional_keys(hashes, worker_id);
+        let handle = self.clone();
+
+        block_on_with_fallback(async move {
+            handle.remove(keys).await;
+        });
+    }
+
+    fn remove_hashes_with_positions_blocking(&self, pairs: &[(u64, u32)], worker_id: u64) {
+        if pairs.is_empty() {
+            return;
+        }
+
+        let keys = hash_position_pairs_to_keys(pairs, worker_id);
+        let handle = self.clone();
+
+        block_on_with_fallback(async move {
+            handle.remove(keys).await;
+        });
     }
 }
 

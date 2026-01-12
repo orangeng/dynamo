@@ -182,28 +182,48 @@ impl BlockTransferHandler for BlockTransferHandlerV1 {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        pipeline
+        let transfer_result = pipeline
             .execute(&bounce_block_list, remote_context, &self.cancel_token)
-            .await?;
+            .await;
 
-        tracing::debug!(
-            request_id = %request.request_id,
-            operation_id = %request.operation_id,
-            "Remote transfer completed successfully"
-        );
+        let success = transfer_result.is_ok();
 
-        // Notify the scheduler that this operation completed (if connector tracking is enabled)
+        if success {
+            tracing::debug!(
+                request_id = %request.request_id,
+                operation_id = %request.operation_id,
+                "Remote transfer completed successfully"
+            );
+        } else {
+            tracing::warn!(
+                request_id = %request.request_id,
+                operation_id = %request.operation_id,
+                error = ?transfer_result.as_ref().err(),
+                "Remote transfer failed"
+            );
+        }
+
+        // Notify the scheduler that this operation completed (success OR failure)
         if let Some(connector_req) = request.connector_req {
             if let Some(scheduler_client) = self.scheduler_client.clone() {
                 tracing::debug!(
                     target = "kvbm-g4",
                     request_id = %request.request_id,
                     operation_id = %request.operation_id,
+                    success = success,
                     "Notifying scheduler of transfer completion"
                 );
 
                 let handle = scheduler_client.schedule_transfer(connector_req).await?;
-                handle.mark_complete(Ok(())).await;
+
+                // Pass the actual result (Ok or Err) to the scheduler
+                match &transfer_result {
+                    Ok(()) => handle.mark_complete(Ok(())).await,
+                    Err(e) => {
+                        // Use {:#} to preserve the error chain in the formatted message
+                        handle.mark_complete(Err(anyhow::anyhow!("{:#}", e))).await
+                    }
+                }
 
                 tracing::debug!(
                     target = "kvbm-g4",
@@ -221,7 +241,8 @@ impl BlockTransferHandler for BlockTransferHandlerV1 {
             }
         }
 
-        Ok(())
+        // Propagate the error if transfer failed
+        transfer_result.map_err(Into::into)
     }
 }
 
@@ -460,7 +481,8 @@ impl<T: ?Sized + BlockTransferHandler> Handler for T {
                     Ok(())
                 }
                 Err(e) => {
-                    handle.mark_complete(Err(anyhow::anyhow!("{}", e))).await;
+                    // Use {:#} to preserve the error chain in the formatted message
+                    handle.mark_complete(Err(anyhow::anyhow!("{:#}", e))).await;
                     Err(e)
                 }
             }

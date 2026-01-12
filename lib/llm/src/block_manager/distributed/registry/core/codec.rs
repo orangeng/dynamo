@@ -21,6 +21,8 @@ pub enum MessageType {
     Match = 3,
     CanOffloadResponse = 4,
     MatchResponse = 5,
+    Remove = 6,
+    RemoveResponse = 7,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -33,6 +35,8 @@ impl TryFrom<u8> for MessageType {
             3 => Ok(Self::Match),
             4 => Ok(Self::CanOffloadResponse),
             5 => Ok(Self::MatchResponse),
+            6 => Ok(Self::Remove),
+            7 => Ok(Self::RemoveResponse),
             _ => Err(()),
         }
     }
@@ -63,12 +67,16 @@ impl TryFrom<u8> for OffloadStatus {
 pub enum QueryType<K> {
     CanOffload(Vec<K>),
     Match(Vec<K>),
+    /// Remove/invalidate entries by key.
+    Remove(Vec<K>),
 }
 
 #[derive(Debug, Clone)]
 pub enum ResponseType<K, V, M> {
     CanOffload(Vec<OffloadStatus>),
     Match(Vec<(K, V, M)>),
+    /// Number of entries removed.
+    Remove(usize),
 }
 
 pub trait RegistryCodec<K, V, M>: Send + Sync
@@ -267,7 +275,7 @@ where
     fn encode_query(&self, query: &QueryType<K>, buf: &mut Vec<u8>) -> RegistryResult<()> {
         buf.push(PROTOCOL_VERSION);
         match query {
-            QueryType::CanOffload(keys) | QueryType::Match(keys) => {
+            QueryType::CanOffload(keys) | QueryType::Match(keys) | QueryType::Remove(keys) => {
                 if keys.len() > u32::MAX as usize {
                     return Err(RegistryError::EncodeError {
                         context: "key count exceeds u32::MAX",
@@ -276,6 +284,7 @@ where
                 let msg_type = match query {
                     QueryType::CanOffload(_) => MessageType::CanOffload,
                     QueryType::Match(_) => MessageType::Match,
+                    QueryType::Remove(_) => MessageType::Remove,
                 };
                 buf.push(msg_type as u8);
                 buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
@@ -323,6 +332,7 @@ where
         match msg_type {
             MessageType::CanOffload => Some(QueryType::CanOffload(keys)),
             MessageType::Match => Some(QueryType::Match(keys)),
+            MessageType::Remove => Some(QueryType::Remove(keys)),
             _ => None,
         }
     }
@@ -380,6 +390,10 @@ where
                     buf.extend_from_slice(&(mb.len() as u16).to_le_bytes());
                     buf.extend_from_slice(&mb);
                 }
+            }
+            ResponseType::Remove(count) => {
+                buf.push(MessageType::RemoveResponse as u8);
+                buf.extend_from_slice(&(*count as u64).to_le_bytes());
             }
         }
         Ok(())
@@ -449,6 +463,14 @@ where
                 }
 
                 Some(ResponseType::Match(entries))
+            }
+            MessageType::RemoveResponse => {
+                // RemoveResponse contains a u64 count (1 byte msg type + 8 byte u64)
+                if data.len() < 1 + 8 {
+                    return None;
+                }
+                let removed = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
+                Some(ResponseType::Remove(removed))
             }
             _ => None,
         }
