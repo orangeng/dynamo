@@ -9,9 +9,9 @@ use dynamo_llm::{
         block::{
             BlockMetadata,
             locality::LocalityProvider,
-            transfer::remote::{ObjectKey, RemoteKey},
+            transfer::remote::{DiskKey, ObjectKey, RemoteKey},
         },
-        config::should_bypass_cpu_cache,
+        config::{should_bypass_cpu_cache, RemoteStorageConfig},
         connector::protocol::{LeaderTransferRequest, RequestType, TransferType},
         distributed::{
             BlockTransferPool, BlockTransferRequest, KvbmLeader, RemoteHashOperations,
@@ -2062,13 +2062,25 @@ async fn process_onboard_request(
 
 /// Filter out blocks that are already stored in object storage.
 /// Returns `None` if all blocks are already stored (nothing to transfer).
-/// Returns `(filtered_hashes, filtered_host_block_ids)` for blocks that need transfer.
+/// Returns `(filtered_hashes_with_positions, filtered_host_block_ids)` for blocks that need transfer.
+///
+/// **IMPORTANT**: Returns `(hash, original_position)` pairs to preserve correct positions
+/// for registry registration. Using `enumerate()` after filtering would produce incorrect
+/// positions (e.g., filtering [A,B,C,D] to [A,C,D] and using enumerate gives A->0, C->1, D->2
+/// when it should be A->0, C->2, D->3).
 async fn filter_already_stored(
     req: &RemoteTransferRequest,
     leader: &Arc<KvbmLeader>,
-) -> Option<(Vec<u64>, Option<Vec<BlockId>>)> {
+) -> Option<(Vec<(u64, u32)>, Option<Vec<BlockId>>)> {
     if req.is_onboard {
-        return Some((req.sequence_hashes.clone(), None));
+        // For onboard, preserve original positions
+        let hashes_with_positions: Vec<(u64, u32)> = req
+            .sequence_hashes
+            .iter()
+            .enumerate()
+            .map(|(pos, &hash)| (hash, pos as u32))
+            .collect();
+        return Some((hashes_with_positions, None));
     }
 
     // Query remote registry to find blocks we can offload
@@ -2102,7 +2114,20 @@ async fn filter_already_stored(
         return None;
     }
 
-    // Filter host block IDs for H2O transfers
+    // Build set of hashes that can be offloaded for efficient lookup
+    let can_offload_set: std::collections::HashSet<u64> =
+        can_offload_hashes.iter().copied().collect();
+
+    // Preserve original positions by filtering from the original sequence
+    let hashes_with_positions: Vec<(u64, u32)> = req
+        .sequence_hashes
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| can_offload_set.contains(hash))
+        .map(|(pos, &hash)| (hash, pos as u32))
+        .collect();
+
+    // Filter host block IDs for H2O transfers (preserving order)
     let filtered_host_ids = req.host_block_ids.as_ref().map(|host_ids| {
         if already_stored.is_empty() {
             host_ids.clone()
@@ -2117,28 +2142,46 @@ async fn filter_already_stored(
         }
     });
 
-    Some((can_offload_hashes, filtered_host_ids))
+    Some((hashes_with_positions, filtered_host_ids))
 }
 
 /// Create a transfer pipeline for the remote transfer request.
+///
+/// Takes `(hash, original_position)` pairs to ensure descriptors are created
+/// with correct positions for registry operations.
+///
+/// Supports both Object storage (S3/MinIO) and Disk storage (shared filesystem).
 async fn create_transfer_pipeline(
     req: &RemoteTransferRequest,
-    filtered_hashes: &[u64],
+    hashes_with_positions: &[(u64, u32)],
     filtered_host_ids: Option<Vec<BlockId>>,
     block_manager: &VllmBlockManager,
-    bucket: &str,
+    storage_config: &RemoteStorageConfig,
 ) -> anyhow::Result<dynamo_llm::block_manager::block::transfer::remote::RemoteTransferPipeline> {
     use dynamo_llm::block_manager::block::transfer::remote::{
         RemoteBlockDescriptor, RemoteTransferPipeline,
     };
 
-    let num_blocks = filtered_hashes.len();
+    let num_blocks = hashes_with_positions.len();
 
-    // Create remote block descriptors from sequence hashes
-    let descriptors: Vec<RemoteBlockDescriptor> = filtered_hashes
-        .iter()
-        .map(|&hash| RemoteBlockDescriptor::object_from_hash(bucket, hash, req.block_size))
-        .collect();
+    // Create remote block descriptors from sequence hashes based on storage type
+    let descriptors: Vec<RemoteBlockDescriptor> = match storage_config {
+        RemoteStorageConfig::Object { default_bucket, .. } => {
+            let bucket = default_bucket.as_deref().unwrap_or("dynamo-kv-cache");
+            hashes_with_positions
+                .iter()
+                .map(|&(hash, _)| {
+                    RemoteBlockDescriptor::object_from_hash(bucket, hash, req.block_size)
+                })
+                .collect()
+        }
+        RemoteStorageConfig::Disk { base_path, .. } => hashes_with_positions
+            .iter()
+            .map(|&(hash, _)| {
+                RemoteBlockDescriptor::disk_from_hash(base_path, hash, req.block_size)
+            })
+            .collect(),
+    };
 
     if req.is_h2o() {
         let host_block_ids = filtered_host_ids
@@ -2184,9 +2227,15 @@ async fn create_transfer_pipeline(
 }
 
 /// Register offloaded blocks with the remote registry.
+///
+/// Takes `(hash, original_position)` pairs to ensure correct positions are registered.
+/// This is critical for prefix matching - incorrect positions would cause cache misses
+/// when looking up blocks by their position in a sequence.
+///
+/// Supports both Object storage (S3/MinIO) and Disk storage (shared filesystem).
 async fn register_offloaded_blocks(
-    hashes: &[u64],
-    bucket: &str,
+    hashes_with_positions: &[(u64, u32)],
+    storage_config: &RemoteStorageConfig,
     leader: &Arc<KvbmLeader>,
     request_id: &str,
 ) {
@@ -2194,23 +2243,45 @@ async fn register_offloaded_blocks(
         return;
     };
 
-    let entries: Vec<(u64, u32, RemoteKey)> = hashes
-        .iter()
-        .enumerate()
-        .map(|(pos, &hash)| {
-            let key = RemoteKey::Object(ObjectKey {
-                bucket: bucket.to_string(),
-                key: format!("{:016x}", hash),
-            });
-            (hash, pos as u32, key)
-        })
-        .collect();
+    // Create RemoteKey entries based on storage type
+    let entries: Vec<(u64, u32, RemoteKey)> = match storage_config {
+        RemoteStorageConfig::Object { default_bucket, .. } => {
+            let bucket = default_bucket.as_deref().unwrap_or("dynamo-kv-cache");
+            hashes_with_positions
+                .iter()
+                .map(|&(hash, position)| {
+                    let key = RemoteKey::Object(ObjectKey {
+                        bucket: bucket.to_string(),
+                        key: format!("{:016x}", hash),
+                    });
+                    (hash, position, key)
+                })
+                .collect()
+        }
+        RemoteStorageConfig::Disk { base_path, .. } => hashes_with_positions
+            .iter()
+            .map(|&(hash, position)| {
+                let key = RemoteKey::Disk(DiskKey {
+                    path: base_path.clone(),
+                    key: format!("{:016x}", hash),
+                });
+                (hash, position, key)
+            })
+            .collect(),
+    };
+
+    let storage_type_str = match storage_config {
+        RemoteStorageConfig::Object { .. } => "object",
+        RemoteStorageConfig::Disk { .. } => "disk",
+    };
 
     tracing::debug!(
         target = "kvbm-g4",
         request_id = %request_id,
+        storage_type = storage_type_str,
         num_entries = entries.len(),
-        "Registering {} entries to remote registry",
+        positions = ?hashes_with_positions.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+        "Registering {} entries to remote registry with original positions",
         entries.len()
     );
 
@@ -2241,7 +2312,9 @@ async fn process_remote_transfer_request(
     };
 
     // Filter out blocks already in object storage
-    let (filtered_hashes, filtered_host_ids) = match filter_already_stored(&req, leader).await {
+    // Returns (hash, original_position) pairs to preserve correct positions for registry
+    let (hashes_with_positions, filtered_host_ids) = match filter_already_stored(&req, leader).await
+    {
         Some(filtered) => filtered,
         None => {
             // All blocks already stored - release pin and return
@@ -2250,7 +2323,7 @@ async fn process_remote_transfer_request(
         }
     };
 
-    let num_blocks = filtered_hashes.len();
+    let num_blocks = hashes_with_positions.len();
 
     // Update metrics
     if req.is_onboard {
@@ -2266,26 +2339,43 @@ async fn process_remote_transfer_request(
     } else {
         "offload"
     };
+    // Get storage configuration from leader
+    let storage_config = leader.remote_storage_config().unwrap_or_else(|| {
+        // Fallback to object storage with default bucket if not configured
+        tracing::warn!(
+            "No remote storage configured, falling back to default object storage"
+        );
+        RemoteStorageConfig::Object {
+            default_bucket: std::env::var("AWS_DEFAULT_BUCKET").ok(),
+            endpoint: None,
+            region: None,
+        }
+    });
+
+    let storage_type_str = match &storage_config {
+        RemoteStorageConfig::Object { .. } => "object",
+        RemoteStorageConfig::Disk { .. } => "disk",
+    };
+
     tracing::debug!(
         target = "kvbm-g4",
         request_id = %request_id,
         operation_id = %operation_id,
         direction = direction,
+        storage_type = storage_type_str,
         num_blocks = num_blocks,
-        "Processing remote {} transfer",
-        direction
+        "Processing remote {} transfer to {} storage",
+        direction,
+        storage_type_str
     );
-
-    let bucket =
-        std::env::var("AWS_DEFAULT_BUCKET").unwrap_or_else(|_| "dynamo-kv-cache".to_string());
 
     // Create the transfer pipeline
     let pipeline = create_transfer_pipeline(
         &req,
-        &filtered_hashes,
+        &hashes_with_positions,
         filtered_host_ids,
         block_manager,
-        &bucket,
+        &storage_config,
     )
     .await?;
 
@@ -2317,7 +2407,13 @@ async fn process_remote_transfer_request(
 
             // Register with remote registry after successful offload
             if !req.is_onboard {
-                register_offloaded_blocks(&filtered_hashes, &bucket, leader, request_id).await;
+                register_offloaded_blocks(
+                    &hashes_with_positions,
+                    &storage_config,
+                    leader,
+                    request_id,
+                )
+                .await;
             }
 
             Ok(())

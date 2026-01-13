@@ -74,7 +74,7 @@ where
 }
 
 /// Default timeout for registry operations.
-const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Channel buffer size for registry commands.
 const CHANNEL_BUFFER_SIZE: usize = 256;
@@ -129,6 +129,12 @@ pub enum RemoteOperation<K, V, M> {
     },
     /// Remove stale entries from the registry.
     Remove {
+        keys: Vec<K>,
+        /// Optional reply for confirmation (None = fire-and-forget).
+        reply: Option<oneshot::Sender<Result<usize, String>>>,
+    },
+    /// Touch keys to notify the registry of access (for LRU/LFU tracking).
+    Touch {
         keys: Vec<K>,
         /// Optional reply for confirmation (None = fire-and-forget).
         reply: Option<oneshot::Sender<Result<usize, String>>>,
@@ -199,6 +205,12 @@ where
                 }
                 RemoteOperation::Remove { keys, reply } => {
                     let result = Self::do_remove(&registry, keys).await;
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                }
+                RemoteOperation::Touch { keys, reply } => {
+                    let result = Self::do_touch(&registry, keys).await;
                     if let Some(reply) = reply {
                         let _ = reply.send(result);
                     }
@@ -304,6 +316,29 @@ where
             Err(_) => {
                 let msg = "Registry remove timed out".to_string();
                 tracing::error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    /// Touch keys to notify access (for LRU/LFU tracking).
+    async fn do_touch(
+        registry: &Arc<dyn Registry<K, V, M> + Send + Sync>,
+        keys: Vec<K>,
+    ) -> Result<usize, String> {
+        match tokio::time::timeout(REGISTRY_TIMEOUT, registry.touch(&keys)).await {
+            Ok(Ok(count)) => {
+                tracing::debug!(touched = count, requested = keys.len(), "Registry touch complete");
+                Ok(count)
+            }
+            Ok(Err(e)) => {
+                let msg = format!("Registry touch failed: {e}");
+                tracing::warn!("{}", msg);
+                Err(msg)
+            }
+            Err(_) => {
+                let msg = "Registry touch timed out".to_string();
+                tracing::warn!("{}", msg);
                 Err(msg)
             }
         }
@@ -448,6 +483,52 @@ where
         if self
             .tx
             .send(RemoteOperation::Remove {
+                keys,
+                reply: Some(tx),
+            })
+            .await
+            .is_err()
+        {
+            return Err("RemoteHandle task has shut down".to_string());
+        }
+
+        rx.await
+            .unwrap_or_else(|_| Err("Channel closed".to_string()))
+    }
+
+    /// Touch keys to notify access (fire and forget).
+    ///
+    /// Used to notify the registry of cache hits for LRU/LFU tracking.
+    /// Call this after successful onboard from G4 or G2 cache hits.
+    pub async fn touch(&self, keys: Vec<K>) {
+        if keys.is_empty() {
+            return;
+        }
+
+        if self
+            .tx
+            .send(RemoteOperation::Touch {
+                keys,
+                reply: None,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("RemoteHandle task has shut down (touch)");
+        }
+    }
+
+    /// Touch keys and wait for confirmation.
+    /// Returns the number of keys touched.
+    pub async fn touch_and_wait(&self, keys: Vec<K>) -> Result<usize, String> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let (tx, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(RemoteOperation::Touch {
                 keys,
                 reply: Some(tx),
             })

@@ -226,6 +226,37 @@ pub mod kvbm {
         pub const DYN_KVBM_TRANSFER_BATCH_SIZE: &str = "DYN_KVBM_TRANSFER_BATCH_SIZE";
     }
 
+    /// Remote storage (G4) configuration
+    ///
+    /// These environment variables control the remote storage tier (G4)
+    /// which supports both object storage (S3/MinIO) and disk storage
+    /// (shared filesystems, NVMe-oF, etc.)
+    pub mod remote_storage {
+        /// Remote storage type: "object", "disk", or "auto" (default: "auto")
+        ///
+        /// - "object": Use object storage (S3/MinIO)
+        /// - "disk": Use shared disk storage (NFS, Lustre, etc.)
+        /// - "auto": Auto-detect based on which env vars are set
+        ///   - If only DYN_KVBM_OBJECT_BUCKET is set -> object
+        ///   - If only DYN_KVBM_REMOTE_DISK_PATH is set -> disk
+        ///   - If both are set -> object (default)
+        pub const DYN_KVBM_REMOTE_STORAGE_TYPE: &str = "DYN_KVBM_REMOTE_STORAGE_TYPE";
+
+        /// Base path for remote disk storage
+        ///
+        /// When set, enables disk-based G4 transfers.
+        /// Supports `{worker_id}` template for per-worker paths.
+        /// Example: "/mnt/shared-nvme/kvcache-{worker_id}"
+        pub const DYN_KVBM_REMOTE_DISK_PATH: &str = "DYN_KVBM_REMOTE_DISK_PATH";
+
+        /// Enable GPU Direct Storage for remote disk transfers
+        ///
+        /// Set to "1" or "true" to enable GDS for GPU->Disk transfers.
+        /// Requires compatible filesystem and GPU drivers.
+        /// Default: true if GDS is available
+        pub const DYN_KVBM_REMOTE_DISK_USE_GDS: &str = "DYN_KVBM_REMOTE_DISK_USE_GDS";
+    }
+
     /// KVBM leader (distributed mode) configuration
     pub mod leader {
         /// Timeout in seconds for KVBM leader and worker initialization
@@ -391,6 +422,9 @@ mod tests {
             kvbm::leader::DYN_KVBM_LEADER_ZMQ_HOST,
             kvbm::leader::DYN_KVBM_LEADER_ZMQ_PUB_PORT,
             kvbm::leader::DYN_KVBM_LEADER_ZMQ_ACK_PORT,
+            kvbm::remote_storage::DYN_KVBM_REMOTE_STORAGE_TYPE,
+            kvbm::remote_storage::DYN_KVBM_REMOTE_DISK_PATH,
+            kvbm::remote_storage::DYN_KVBM_REMOTE_DISK_USE_GDS,
             // LLM
             llm::DYN_HTTP_BODY_LIMIT_MB,
             llm::DYN_LORA_ENABLED,

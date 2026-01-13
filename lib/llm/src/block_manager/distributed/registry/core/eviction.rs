@@ -301,6 +301,10 @@ where
     insertion_order: RwLock<HashMap<u64, Vec<K>>>,
     /// Track which positions have entries, ordered by position (descending for eviction)
     positions: RwLock<BTreeSet<std::cmp::Reverse<u64>>>,
+    /// Track last access time for each key (for LRU-style eviction)
+    last_access: RwLock<HashMap<K, std::time::Instant>>,
+    /// Track access count for each key (for LFU-style eviction)
+    access_count: RwLock<HashMap<K, u64>>,
 }
 
 impl<K, V> PositionalEviction<K, V>
@@ -314,11 +318,49 @@ where
             capacity,
             insertion_order: RwLock::new(HashMap::new()),
             positions: RwLock::new(BTreeSet::new()),
+            last_access: RwLock::new(HashMap::new()),
+            access_count: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self::new(RadixStorage::new(), capacity)
+    }
+
+    /// Record an access for a key (used for LRU/LFU tracking).
+    ///
+    /// Called when a cache hit occurs (e.g., onboard from G4, or G2 cache hit).
+    /// Updates both last_access time and access_count.
+    pub fn touch(&self, key: &K) {
+        if self.inner.contains(key) {
+            let now = std::time::Instant::now();
+            self.last_access.write().insert(*key, now);
+            *self.access_count.write().entry(*key).or_insert(0) += 1;
+        }
+    }
+
+    /// Batch touch multiple keys for efficiency.
+    pub fn touch_many(&self, keys: &[K]) -> usize {
+        let now = std::time::Instant::now();
+        let mut touched = 0;
+        let mut last_access = self.last_access.write();
+        let mut access_count = self.access_count.write();
+
+        for key in keys {
+            if self.inner.contains(key) {
+                last_access.insert(*key, now);
+                *access_count.entry(*key).or_insert(0) += 1;
+                touched += 1;
+            }
+        }
+        touched
+    }
+
+    /// Get access statistics for a key.
+    pub fn get_access_stats(&self, key: &K) -> Option<(std::time::Instant, u64)> {
+        let last = self.last_access.read().get(key).copied();
+        let count = self.access_count.read().get(key).copied().unwrap_or(0);
+        last.map(|t| (t, count))
     }
 
     fn maybe_evict(&self) {
@@ -336,13 +378,44 @@ where
         // Get highest position (due to Reverse wrapper, first() gives highest)
         let highest_pos = positions.iter().next().map(|r| r.0)?;
 
-        // Get the first (oldest) key at this position
+        // Get the keys at this position
         let keys = insertion_order.get_mut(&highest_pos)?;
         if keys.is_empty() {
             return None;
         }
 
-        let key = keys.remove(0);
+        // Find the least-recently-used key at this position
+        // Falls back to insertion order (FIFO) if no access tracking
+        let key = {
+            let last_access = self.last_access.read();
+            let access_count = self.access_count.read();
+
+            // Find key with oldest access time (or lowest access count as tiebreaker)
+            // If no access tracking, use first key (insertion order)
+            let mut best_idx = 0;
+            let mut best_time: Option<std::time::Instant> = None;
+            let mut best_count: u64 = u64::MAX;
+
+            for (idx, key) in keys.iter().enumerate() {
+                let time = last_access.get(key).copied();
+                let count = access_count.get(key).copied().unwrap_or(0);
+
+                let is_better = match (best_time, time) {
+                    (None, None) => count < best_count,
+                    (None, Some(_)) => false, // Prefer keys without access tracking
+                    (Some(_), None) => true,  // Keys without tracking are evicted first
+                    (Some(bt), Some(t)) => t < bt || (t == bt && count < best_count),
+                };
+
+                if is_better {
+                    best_idx = idx;
+                    best_time = time;
+                    best_count = count;
+                }
+            }
+
+            keys.remove(best_idx)
+        };
 
         // If position is now empty, remove it from tracking
         if keys.is_empty() {
@@ -352,6 +425,10 @@ where
 
         drop(positions);
         drop(insertion_order);
+
+        // Clean up access tracking for evicted key
+        self.last_access.write().remove(&key);
+        self.access_count.write().remove(&key);
 
         self.inner.remove(&key);
         Some(key)
@@ -402,6 +479,10 @@ where
             }
         }
 
+        // Clean up access tracking
+        self.last_access.write().remove(key);
+        self.access_count.write().remove(key);
+
         self.inner.remove(key)
     }
 
@@ -412,6 +493,8 @@ where
     fn clear(&self) {
         self.positions.write().clear();
         self.insertion_order.write().clear();
+        self.last_access.write().clear();
+        self.access_count.write().clear();
         self.inner.clear();
     }
 }

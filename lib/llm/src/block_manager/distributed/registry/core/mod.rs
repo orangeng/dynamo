@@ -6,12 +6,15 @@
 pub mod builder;
 pub mod codec;
 pub mod error;
+pub mod events;
 pub mod eviction;
+pub mod gc;
 pub mod hub;
 pub mod hub_transport;
 pub mod key;
 pub mod lease;
 pub mod metadata;
+pub mod persistence;
 pub mod registry;
 pub mod storage;
 pub mod transport;
@@ -59,3 +62,21 @@ pub use builder::{ClientBuilder, HubBuilder, client, hub};
 
 // ZMQ Hub
 pub use zmq_hub::{ZmqHub, ZmqHubConfig as ZmqHubServerConfig};
+
+// Persistence
+pub use persistence::{
+    AccessStats, HybridPersistence, LocalDiskBackend, PersistenceBackend, PersistenceConfig,
+    PersistedEntry, RegistrySnapshot, SnapshotPersistence, WalEntry, WalPersistence,
+};
+
+// Event Bus
+pub use events::{
+    EventBus, EventBusConfig, EventHandler, EventReceiver, EventTopic, EvictionReason,
+    InProcessEventBus, RegistryEvent, StorageTier, StorageType,
+};
+
+// Garbage Collection
+pub use gc::{
+    DiskStorageLister, GarbageCollector, GcConfig, GcStats, ObjectStorageLister, RegistryLister,
+    StorageLister,
+};

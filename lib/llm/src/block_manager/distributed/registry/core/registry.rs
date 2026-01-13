@@ -50,6 +50,15 @@ where
     /// Returns the number of entries that were removed.
     /// This is used to clean up stale entries (e.g., when object storage returns NoSuchKey).
     async fn remove(&self, keys: &[K]) -> Result<usize>;
+
+    /// Notify the registry that entries were accessed (cache hit).
+    ///
+    /// Used for LRU/LFU eviction policies to track access recency/frequency.
+    /// Returns the number of keys that were touched (acknowledged).
+    ///
+    /// This is typically called after a successful onboard from G4 storage,
+    /// or when blocks are accessed from G2 (host) cache.
+    async fn touch(&self, keys: &[K]) -> Result<usize>;
 }
 
 /// Pending batch state.
@@ -298,6 +307,27 @@ where
         match decoded {
             ResponseType::Remove(count) => Ok(count),
             _ => Err(anyhow::anyhow!("unexpected response type for remove")),
+        }
+    }
+
+    async fn touch(&self, keys: &[K]) -> Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut buf = Vec::new();
+        self.codec
+            .encode_query(&QueryType::Touch(keys.to_vec()), &mut buf)?;
+
+        let response = self.transport.request(&buf).await?;
+        let decoded = self
+            .codec
+            .decode_response(&response)
+            .ok_or_else(|| anyhow::anyhow!("invalid response"))?;
+
+        match decoded {
+            ResponseType::Touch(count) => Ok(count),
+            _ => Err(anyhow::anyhow!("unexpected response type for touch")),
         }
     }
 }

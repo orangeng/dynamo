@@ -181,6 +181,74 @@ impl KvbmLeader {
         self.config.rank as u64
     }
 
+    /// Get the remote storage configuration based on environment variables.
+    ///
+    /// Returns `Some(config)` if remote storage is configured, `None` otherwise.
+    /// This mirrors the logic in `create_remote_context` in worker.rs.
+    ///
+    /// Environment variables:
+    /// - `DYN_KVBM_REMOTE_STORAGE_TYPE`: "object", "disk", or "auto" (default: "auto")
+    /// - `DYN_KVBM_OBJECT_BUCKET` or `AWS_DEFAULT_BUCKET`: Bucket name for object storage
+    /// - `DYN_KVBM_REMOTE_DISK_PATH`: Base path for disk storage
+    /// - `DYN_KVBM_REMOTE_DISK_USE_GDS`: Enable GPU Direct Storage for disk (default: true)
+    pub fn remote_storage_config(&self) -> Option<crate::block_manager::config::RemoteStorageConfig>
+    {
+        use crate::block_manager::config::RemoteStorageConfig;
+
+        let worker_id = self.config.rank;
+        let storage_type = std::env::var("DYN_KVBM_REMOTE_STORAGE_TYPE")
+            .unwrap_or_else(|_| "auto".to_string())
+            .to_lowercase();
+
+        // Get object storage config
+        let bucket = std::env::var("DYN_KVBM_OBJECT_BUCKET")
+            .or_else(|_| std::env::var("AWS_DEFAULT_BUCKET"))
+            .ok()
+            .map(|b| b.replace("{worker_id}", &worker_id.to_string()));
+
+        let object_endpoint = std::env::var("DYN_KVBM_OBJECT_ENDPOINT")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .or_else(|_| std::env::var("AWS_ENDPOINT_OVERRIDE"))
+            .ok();
+
+        let object_region = std::env::var("DYN_KVBM_OBJECT_REGION")
+            .or_else(|_| std::env::var("AWS_REGION"))
+            .ok();
+
+        // Get disk storage config
+        let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
+            .ok()
+            .map(|p| p.replace("{worker_id}", &worker_id.to_string()));
+
+        let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(true);
+
+        match storage_type.as_str() {
+            "disk" => disk_path.map(|path| RemoteStorageConfig::Disk {
+                base_path: path,
+                use_gds: disk_use_gds,
+            }),
+            "object" => Some(RemoteStorageConfig::Object {
+                default_bucket: bucket,
+                endpoint: object_endpoint,
+                region: object_region,
+            }),
+            "auto" | _ => match (&bucket, &disk_path) {
+                (Some(_), Some(_)) | (Some(_), None) => Some(RemoteStorageConfig::Object {
+                    default_bucket: bucket,
+                    endpoint: object_endpoint,
+                    region: object_region,
+                }),
+                (None, Some(path)) => Some(RemoteStorageConfig::Disk {
+                    base_path: path.clone(),
+                    use_gds: disk_use_gds,
+                }),
+                (None, None) => None,
+            },
+        }
+    }
+
     /// Send a remote transfer request to the workers.
     /// Used for both G4 onboard (object -> device) and offload (device -> object).
     pub async fn remote_transfer_request(

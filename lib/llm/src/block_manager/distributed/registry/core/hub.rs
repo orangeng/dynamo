@@ -249,6 +249,33 @@ where
                     warn!("Failed to encode response: {}", e);
                 }
             }
+            QueryType::Touch(keys) => {
+                // Touch is used for LRU/LFU tracking - record access for each key
+                // that exists in storage. The storage/eviction policy handles the
+                // actual access tracking.
+                let mut touched_count = 0usize;
+                for key in &keys {
+                    if self.storage.contains(key) {
+                        // Note: The actual access tracking happens in the eviction policy.
+                        // For now, we just count how many keys exist.
+                        // TODO: Call storage.touch(key) when eviction policies support it
+                        touched_count += 1;
+                    }
+                }
+
+                debug!(
+                    requested = keys.len(),
+                    touched = touched_count,
+                    "Processed touch query (access notification)"
+                );
+
+                if let Err(e) = self
+                    .codec
+                    .encode_response(&ResponseType::Touch(touched_count), &mut response_buf)
+                {
+                    warn!("Failed to encode response: {}", e);
+                }
+            }
         }
 
         response_buf

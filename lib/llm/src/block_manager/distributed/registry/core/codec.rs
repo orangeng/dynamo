@@ -23,6 +23,9 @@ pub enum MessageType {
     MatchResponse = 5,
     Remove = 6,
     RemoveResponse = 7,
+    /// Touch/access notification for LRU/LFU tracking
+    Touch = 8,
+    TouchResponse = 9,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -37,6 +40,8 @@ impl TryFrom<u8> for MessageType {
             5 => Ok(Self::MatchResponse),
             6 => Ok(Self::Remove),
             7 => Ok(Self::RemoveResponse),
+            8 => Ok(Self::Touch),
+            9 => Ok(Self::TouchResponse),
             _ => Err(()),
         }
     }
@@ -69,6 +74,9 @@ pub enum QueryType<K> {
     Match(Vec<K>),
     /// Remove/invalidate entries by key.
     Remove(Vec<K>),
+    /// Touch/access notification for LRU/LFU tracking.
+    /// Fire-and-forget: notifies the registry that keys were accessed (cache hit).
+    Touch(Vec<K>),
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +85,8 @@ pub enum ResponseType<K, V, M> {
     Match(Vec<(K, V, M)>),
     /// Number of entries removed.
     Remove(usize),
+    /// Number of entries touched (acknowledged).
+    Touch(usize),
 }
 
 pub trait RegistryCodec<K, V, M>: Send + Sync
@@ -275,7 +285,10 @@ where
     fn encode_query(&self, query: &QueryType<K>, buf: &mut Vec<u8>) -> RegistryResult<()> {
         buf.push(PROTOCOL_VERSION);
         match query {
-            QueryType::CanOffload(keys) | QueryType::Match(keys) | QueryType::Remove(keys) => {
+            QueryType::CanOffload(keys)
+            | QueryType::Match(keys)
+            | QueryType::Remove(keys)
+            | QueryType::Touch(keys) => {
                 if keys.len() > u32::MAX as usize {
                     return Err(RegistryError::EncodeError {
                         context: "key count exceeds u32::MAX",
@@ -285,6 +298,7 @@ where
                     QueryType::CanOffload(_) => MessageType::CanOffload,
                     QueryType::Match(_) => MessageType::Match,
                     QueryType::Remove(_) => MessageType::Remove,
+                    QueryType::Touch(_) => MessageType::Touch,
                 };
                 buf.push(msg_type as u8);
                 buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
@@ -333,6 +347,7 @@ where
             MessageType::CanOffload => Some(QueryType::CanOffload(keys)),
             MessageType::Match => Some(QueryType::Match(keys)),
             MessageType::Remove => Some(QueryType::Remove(keys)),
+            MessageType::Touch => Some(QueryType::Touch(keys)),
             _ => None,
         }
     }
@@ -393,6 +408,10 @@ where
             }
             ResponseType::Remove(count) => {
                 buf.push(MessageType::RemoveResponse as u8);
+                buf.extend_from_slice(&(*count as u64).to_le_bytes());
+            }
+            ResponseType::Touch(count) => {
+                buf.push(MessageType::TouchResponse as u8);
                 buf.extend_from_slice(&(*count as u64).to_le_bytes());
             }
         }
@@ -471,6 +490,14 @@ where
                 }
                 let removed = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
                 Some(ResponseType::Remove(removed))
+            }
+            MessageType::TouchResponse => {
+                // TouchResponse contains a u64 count (1 byte msg type + 8 byte u64)
+                if data.len() < 1 + 8 {
+                    return None;
+                }
+                let touched = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
+                Some(ResponseType::Touch(touched))
             }
             _ => None,
         }
