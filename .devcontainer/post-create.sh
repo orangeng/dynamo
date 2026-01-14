@@ -114,11 +114,7 @@ Now build the project:
   uv pip install -e lib/gpu_memory_service
   DYNAMO_BIN_PATH=\$CARGO_TARGET_DIR/debug uv pip install -e .
 
-Optional:
-  cd lib/bindings/kvbm && maturin develop --uv  # For KVBM support
-
-To rebuild gpu_memory_service after code changes:
-  pip install --no-build-isolation \$WORKSPACE_DIR/lib/gpu_memory_service
+Optional: cd lib/bindings/kvbm && maturin develop --uv  # For KVBM support
 
 If cargo build fails with a Cargo.lock error, try to update it with 'cargo update'
 ========================================

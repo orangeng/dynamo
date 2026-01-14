@@ -434,10 +434,13 @@ RUN --mount=type=secret,id=aws-key-id,env=AWS_ACCESS_KEY_ID \
     fi && \
     /tmp/use-sccache.sh show-stats "Dynamo"
 
-# Build gpu_memory_service wheel (C++ extension only needs Python headers, no CUDA/torch)
+# Build gpu_memory_service and torch_memory_saver wheels
+# torch_memory_saver is required by SGLang's GPU Memory Service adapters
 RUN source ${VIRTUAL_ENV}/bin/activate && \
     cd /opt/dynamo/lib/gpu_memory_service && \
-    pip wheel --no-deps --wheel-dir /opt/dynamo/dist .
+    pip wheel --no-deps --wheel-dir /opt/dynamo/dist . && \
+    pip wheel --no-deps --wheel-dir /opt/dynamo/dist \
+        git+https://github.com/fzyzcjy/torch_memory_saver.git
 
 ##################################
 ########## Runtime Image #########
@@ -493,6 +496,7 @@ RUN --mount=type=bind,source=.,target=/mnt/local_src \
         /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
         /opt/dynamo/wheelhouse/gpu_memory_service*.whl \
         /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
+        /opt/dynamo/wheelhouse/torch_memory_saver*.whl \
         sglang==${SGLANG_VERSION}
 
 # Install common and test dependencies
