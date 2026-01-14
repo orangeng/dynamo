@@ -86,12 +86,12 @@ def _setup_gpu_memory_service_if_needed(config: Config) -> None:
     # Register loader and apply patches in main process
     try:
         from dynamo.vllm.gpu_memory_service_adapters import (
-            patch_model_runner_for_gpu_memory_service,
+            apply_all_patches,
             register_gpu_memory_service_loader,
         )
 
         register_gpu_memory_service_loader()
-        patch_model_runner_for_gpu_memory_service()
+        apply_all_patches()
         logger.info(
             "[GPU Memory Service] Registered GPU Memory Service loader and applied patches"
         )

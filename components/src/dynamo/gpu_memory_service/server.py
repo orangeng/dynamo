@@ -85,7 +85,7 @@ class GMSRPCServerThread:
                 self._loop.run_until_complete(asyncio.sleep(1))
 
         except Exception as e:
-            logger.error(f"GMSRPCServer error: {e}")
+            logger.exception(f"GMSRPCServer error: {e}")
             self._error = e
             self._started.set()  # Unblock waiter even on error
         finally:
