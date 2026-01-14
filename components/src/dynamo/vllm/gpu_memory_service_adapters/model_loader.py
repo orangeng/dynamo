@@ -4,7 +4,7 @@ This module registers a vLLM `load_format` that loads model weights into
 GPU Memory Service allocations (RW session), publishes via Commit(), and then
 holds an RO lock for inference lifetime.
 
-The model loader uses "auto" mode to connect to the GPU Memory Service:
+The model loader uses RW_OR_RO mode to connect to the GPU Memory Service:
 - First process to connect gets RW lock and loads weights from disk
 - Subsequent processes get RO lock and import weights from metadata store
 This enables weight sharing across processes without explicit configuration.
@@ -30,8 +30,6 @@ actually free GPU memory during sleep, use native vLLM sleep/wake (without GPU M
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 from dataclasses import replace
@@ -39,7 +37,8 @@ from typing import Any, Optional
 
 import torch
 
-from dynamo.gpu_memory_service import get_or_create_allocator
+from dynamo.gpu_memory_service import get_or_create_gms_client_memory_manager
+from gpu_memory_service.common.types import GrantedLockType, RequestedLockType
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +63,16 @@ def _safe_empty_cache() -> None:
     global _original_empty_cache
     # Check if we have GPU Memory Service VMM allocations
     try:
-        from dynamo.gpu_memory_service import _allocator_ext as cumem
+        from dynamo.gpu_memory_service import get_gms_client_memory_manager
 
-        allocations = cumem.get_all_allocations()
-        if allocations:
+        gms_client_memory_manager = get_gms_client_memory_manager()
+        if gms_client_memory_manager is not None and len(gms_client_memory_manager._mappings) > 0:
             # We have VMM allocations - skip empty_cache to prevent segfault
             import traceback
 
             logger.debug(
                 "[GPU Memory Service PATCH] BLOCKING torch.cuda.empty_cache() - %d VMM allocations would be destroyed!",
-                len(allocations),
+                len(gms_client_memory_manager._mappings),
             )
             logger.debug(
                 "[GPU Memory Service PATCH] Call stack:\n%s",
@@ -203,30 +202,6 @@ def _resolve_socket_path(load_config: Any = None) -> str:
     return socket_path
 
 
-def compute_vllm_config_hash(vllm_config: Any) -> str:
-    """Best-effort stable hash for metadata key prefixing."""
-    # Avoid pickling vLLM internals; serialize a small stable subset.
-    payload = {
-        "model": getattr(getattr(vllm_config, "model_config", None), "model", None),
-        "revision": getattr(
-            getattr(vllm_config, "model_config", None), "revision", None
-        ),
-        "dtype": str(
-            getattr(getattr(vllm_config, "model_config", None), "dtype", None)
-        ),
-        "tp": getattr(
-            getattr(vllm_config, "parallel_config", None), "tensor_parallel_size", None
-        ),
-        "pp": getattr(
-            getattr(vllm_config, "parallel_config", None),
-            "pipeline_parallel_size",
-            None,
-        ),
-    }
-    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()[:16]
-
-
 def register_gpu_memory_service_loader(load_format: str = "gpu_memory_service") -> None:
     """Register vLLM loader that allocates via GPU Memory Service."""
     try:
@@ -241,16 +216,48 @@ def register_gpu_memory_service_loader(load_format: str = "gpu_memory_service") 
     except ImportError as e:
         raise RuntimeError(f"vLLM not installed or incompatible: {e}")
 
-    # Import the extension lazily so importing this module doesn't require it.
-    try:
-        from dynamo.gpu_memory_service import _allocator_ext as cumem
-    except Exception as e:
-        raise RuntimeError(
-            "Missing CUDA VMM pluggable allocator extension. "
-            "Build gpu_memory_service/core/csrc/allocator.cpp first."
-        ) from e
-
     from torch.cuda.memory import use_mem_pool
+
+    def _create_meta_model(vllm_config, model_config) -> torch.nn.Module:
+        """Create model structure on meta device with post-processed parameters.
+
+        Used for RO mode where weights are materialized from GMS metadata.
+        This creates the model skeleton without loading weights from disk,
+        then runs quantization post-processing to ensure the parameter structure
+        matches what was registered during write mode.
+        """
+        meta_device = torch.device("meta")
+
+        # Enable meta tensor workaround for operations like torch.nonzero()
+        # that don't have proper meta implementations. Needed for models like
+        # Qwen3-MoE that use torch.nonzero during initialization.
+        try:
+            import torch.fx.experimental._config as fx_config
+
+            fx_config.meta_nonzero_assume_all_nonzero = True
+        except (ImportError, AttributeError):
+            pass
+
+        # Create model on meta device - no GPU memory allocated
+        with set_default_torch_dtype(model_config.dtype):
+            with meta_device:
+                model = initialize_model(
+                    vllm_config=vllm_config, model_config=model_config
+                )
+
+        # Run quantization post-processing to get the FINAL parameter structure.
+        # This is critical because write mode runs post-processing BEFORE
+        # registering tensors, and post-processing can create/destroy/rename
+        # parameters. Without this step, materialize_module_from_gms would fail
+        # due to parameter name mismatches.
+        try:
+            process_weights_after_loading(model, model_config, meta_device)
+        except Exception as e:
+            logger.debug(
+                "[GPU Memory Service] Post-processing on meta tensors: %s", e
+            )
+
+        return model
 
     @register_model_loader(load_format)
     class GPUServiceModelLoader(BaseModelLoader):
@@ -304,57 +311,45 @@ def register_gpu_memory_service_loader(load_format: str = "gpu_memory_service") 
                     target_device.index if target_device.index is not None else 0
                 )
 
-            # Acquire lock and prepare metadata namespace.
-            config_hash = compute_vllm_config_hash(vllm_config)
-
-            # Use "auto" mode to handle multiprocess architectures:
+            # Use RW_OR_RO mode to handle multiprocess architectures:
             # - First process to connect gets RW lock and loads from disk
             # - Subsequent processes get RO lock and import from metadata
             # The GMS client's rw_or_ro mode tries RW first, falls back to RO if unavailable.
             logger.info(
-                "[GPU Memory Service] Connecting to GMS (socket=%s, device=%d, mode=auto)",
+                "[GPU Memory Service] Connecting to GMS (socket=%s, device=%d, mode=RW_OR_RO)",
                 socket_path,
                 device_index,
             )
 
-            # Get or create allocator with automatic mode selection.
-            # The client module ensures only one allocator exists per process.
-            allocator, pool = get_or_create_allocator(
-                socket_path, device_index, mode="auto", tag="weights"
+            # Get or create GMS client memory manager with automatic mode selection.
+            # The client module ensures only one GMS client memory manager exists per process.
+            gms_client_memory_manager, pool = get_or_create_gms_client_memory_manager(
+                socket_path, device_index, mode=RequestedLockType.RW_OR_RO, tag="weights"
             )
 
             # Check what mode was actually granted
-            granted_mode = allocator.mode
+            granted_mode = gms_client_memory_manager.mode
             logger.info(
                 "[GPU Memory Service] GMS connection established, granted mode=%s",
                 granted_mode,
             )
 
-            if granted_mode == "read":
+            if granted_mode == GrantedLockType.RO:
                 # We got RO lock - import weights from metadata (another process loaded them)
                 try:
                     from dynamo.gpu_memory_service import materialize_module_from_gms
-                    from dynamo.vllm.gpu_memory_service_adapters.import_only_loader import (
-                        ImportOnlyModelLoader as VLLMImportOnlyLoader,
-                    )
 
                     # Create the model structure on meta device with post-processing.
-                    # ImportOnlyModelLoader creates the model and runs quant post-processing
-                    # to ensure the parameter structure matches what was registered.
-                    import_only_loader = VLLMImportOnlyLoader(self.load_config)
-                    model = import_only_loader.load_model(
-                        vllm_config=vllm_config, model_config=model_config
-                    )
+                    model = _create_meta_model(vllm_config, model_config)
 
-                    imported_bytes = materialize_module_from_gms(
-                        allocator,
+                    materialize_module_from_gms(
+                        gms_client_memory_manager,
                         model,
-                        prefix=f"{config_hash}:",
                         device_index=device_index,
-                        strict=True,
                     )
-                    GPUServiceModelLoader._imported_weights_bytes = int(imported_bytes)
-                    _gpu_memory_service_imported_weights_bytes = int(imported_bytes)
+                    imported_bytes = gms_client_memory_manager.total_bytes
+                    GPUServiceModelLoader._imported_weights_bytes = imported_bytes
+                    _gpu_memory_service_imported_weights_bytes = imported_bytes
 
                     # Apply vLLM worker patches
                     from dynamo.vllm.gpu_memory_service_adapters.worker_extension import (
@@ -370,15 +365,15 @@ def register_gpu_memory_service_loader(load_format: str = "gpu_memory_service") 
 
                     return model.eval()
                 except Exception:
-                    allocator.close()
+                    gms_client_memory_manager.close()
                     raise
 
             # We got RW lock - load weights from disk
             assert pool is not None, "Expected MemPool for write mode"
 
             # Start fresh (weights model load is authoritative).
-            allocator.clear_all()
-            allocator.metadata_delete_prefix(f"{config_hash}:")
+            # clear_all() removes all allocations and metadata.
+            gms_client_memory_manager.clear_all()
 
             # Route allocations to the pool while initializing + loading weights.
             # Create a copy with valid load_format and stripped GPU Memory Service keys for DefaultModelLoader.
@@ -415,24 +410,22 @@ def register_gpu_memory_service_loader(load_format: str = "gpu_memory_service") 
             # Register all model tensors into the GMS metadata store
             from dynamo.gpu_memory_service import register_module_tensors
 
-            total_bytes = register_module_tensors(
-                allocator, model, metadata_prefix=f"{config_hash}:"
-            )
+            register_module_tensors(gms_client_memory_manager, model)
+            total_bytes = gms_client_memory_manager.total_bytes
             GPUServiceModelLoader._imported_weights_bytes = total_bytes
             _gpu_memory_service_imported_weights_bytes = total_bytes
 
-            # Sync and flip access to read-only before publishing.
+            # Sync before publishing. Note: commit() handles flipping access to RO.
             torch.cuda.synchronize()
-            cumem.set_access_all(True)
 
-            # Commit and switch to read mode (same allocator instance!)
-            ok = allocator.commit()
+            # Commit and switch to read mode (same manager instance!)
+            ok = gms_client_memory_manager.commit()
             if not ok:
                 raise RuntimeError("Allocation Server commit failed")
 
-            allocator.switch_to_read()
+            gms_client_memory_manager.switch_to_read()
 
-            # Allocator is already registered from get_or_create_allocator().
+            # GMS client memory manager is already registered from get_or_create_gms_client_memory_manager().
             # No need to register again.
 
             # Apply vLLM worker patches
@@ -445,7 +438,7 @@ def register_gpu_memory_service_loader(load_format: str = "gpu_memory_service") 
             logger.info(
                 "[GPU Memory Service] Write mode published %.2f GiB, switched to read mode with %d mappings",
                 total_bytes / (1 << 30),
-                len(allocator._mappings),
+                len(gms_client_memory_manager._mappings),
             )
 
             return model.eval()
