@@ -434,26 +434,10 @@ RUN --mount=type=secret,id=aws-key-id,env=AWS_ACCESS_KEY_ID \
     fi && \
     /tmp/use-sccache.sh show-stats "Dynamo"
 
-# Build gpu_memory_service wheel with CUDA extensions
-# Install pip, setuptools, wheel for building, torch for CUDA extensions
-# IMPORTANT: Use --no-build-isolation so the build inherits CUDA_PATH and can find nvcc
-# With --no-build-isolation, build deps (setuptools, wheel) must be pre-installed
+# Build gpu_memory_service wheel (C++ extension only needs Python headers, no CUDA/torch)
 RUN source ${VIRTUAL_ENV}/bin/activate && \
-    uv pip install pip setuptools wheel && \
-    uv pip install torch --index-url https://download.pytorch.org/whl/cu124 --no-cache-dir && \
     cd /opt/dynamo/lib/gpu_memory_service && \
-    pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/gpu_memory_service_wheels . && \
-    auditwheel repair \
-        --only-plat \
-        --exclude libcuda.so.1 \
-        --exclude libc10.so \
-        --exclude libtorch.so \
-        --exclude libtorch_python.so \
-        --exclude libtorch_cpu.so \
-        --plat manylinux_2_28_${ARCH_ALT} \
-        --wheel-dir /opt/dynamo/dist \
-        /tmp/gpu_memory_service_wheels/gpu_memory_service*.whl && \
-    uv pip uninstall torch pip setuptools wheel
+    pip wheel --no-deps --wheel-dir /opt/dynamo/dist .
 
 ##################################
 ########## Runtime Image #########
@@ -507,8 +491,8 @@ ENV SGLANG_VERSION="${RUNTIME_IMAGE_TAG%%-*}"
 RUN --mount=type=bind,source=.,target=/mnt/local_src \
     pip install --no-cache-dir --break-system-packages \
         /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
-        /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
         /opt/dynamo/wheelhouse/gpu_memory_service*.whl \
+        /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
         sglang==${SGLANG_VERSION}
 
 # Install common and test dependencies
