@@ -30,12 +30,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Set
 
 from gpu_memory_service.common.types import (
-    RW_REQUIRED_OPS,
-    STATE_ALLOWED_OPS,
     ConnectionMode,
-    Operation,
     ServerState,
     StateEvent,
+    RW_ALLOWED,
+    RW_REQUIRED,
+    RO_ALLOWED,
 )
 
 logger = logging.getLogger(__name__)
@@ -342,11 +342,11 @@ class GlobalLockFSM:
 
     # ==================== Operation Permissions ====================
 
-    def check_operation(self, op: Operation, conn: Connection) -> None:
-        """Check if an operation is allowed for the given connection.
+    def check_operation(self, msg_type: type, conn: Connection) -> None:
+        """Check if a request type is allowed for the given connection.
 
         Args:
-            op: The operation to check
+            msg_type: The request message type (e.g., AllocateRequest)
             conn: The connection attempting the operation
 
         Raises:
@@ -354,17 +354,23 @@ class GlobalLockFSM:
         """
         current_state = self.state
 
-        # Check state allows this operation
-        allowed_ops = STATE_ALLOWED_OPS.get(current_state, frozenset())
-        if op not in allowed_ops:
+        # Determine allowed operations based on state
+        if current_state == ServerState.RW:
+            allowed = RW_ALLOWED
+        elif current_state == ServerState.RO:
+            allowed = RO_ALLOWED
+        else:
+            allowed = frozenset()  # EMPTY and COMMITTED have no connections
+
+        if msg_type not in allowed:
             raise OperationNotAllowed(
-                f"Operation {op.name} not allowed in state {current_state.name}"
+                f"{msg_type.__name__} not allowed in state {current_state.name}"
             )
 
         # Check connection mode
-        if op in RW_REQUIRED_OPS and conn.mode != ConnectionMode.RW:
+        if msg_type in RW_REQUIRED and conn.mode != ConnectionMode.RW:
             raise OperationNotAllowed(
-                f"Operation {op.name} requires RW connection, "
+                f"{msg_type.__name__} requires RW connection, "
                 f"but connection is {conn.mode.value}"
             )
 

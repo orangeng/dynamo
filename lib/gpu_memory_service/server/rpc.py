@@ -20,33 +20,9 @@ import logging
 import os
 from typing import Optional
 
-from gpu_memory_service.common.protocol import (
-    AllocateRequest,
-    ClearAllRequest,
-    CommitRequest,
-    CommitResponse,
-    ErrorResponse,
-    ExportRequest,
-    FreeRequest,
-    GetAllocationRequest,
-    GetAllocationStateRequest,
-    GetLockStateRequest,
-    HandshakeRequest,
-    HandshakeResponse,
-    ListAllocationsRequest,
-    MetadataDeleteRequest,
-    MetadataGetRequest,
-    MetadataListRequest,
-    MetadataPutRequest,
-    recv_message,
-    send_message,
-)
-from gpu_memory_service.common.types import (
-    ConnectionMode,
-    Operation,
-    ServerState,
-    StateEvent,
-)
+from gpu_memory_service.common.protocol.messages import *  # noqa: F401,F403
+from gpu_memory_service.common.protocol.wire import *  # noqa: F401,F403
+from gpu_memory_service.common.types import ConnectionMode, ServerState, StateEvent
 
 from .handler import RequestHandler
 from .locking import Connection, GlobalLockFSM
@@ -258,8 +234,6 @@ class GMSRPCServer:
                 except asyncio.TimeoutError:
                     return None
 
-        return None  # Unknown mode
-
     async def _cleanup_connection(
         self, conn: Optional[Connection], session_id: str
     ) -> None:
@@ -318,78 +292,61 @@ class GMSRPCServer:
                 logger.error(f"Request error: {e}")
                 await send_message(conn.writer, ErrorResponse(error=str(e)))
 
-    async def _dispatch(self, conn: Connection, msg) -> tuple[object, int, bool]:
-        """Dispatch request to handler. Returns (response, fd, should_close).
+    # Dispatch table: message type -> handler method name
+    # Handlers take (msg) and return response. Special cases handled separately.
+    _HANDLERS: dict[type, str] = {
+        AllocateRequest: "handle_allocate",
+        GetAllocationRequest: "handle_get_allocation",
+        ListAllocationsRequest: "handle_list_allocations",
+        FreeRequest: "handle_free",
+        MetadataPutRequest: "handle_metadata_put",
+        MetadataGetRequest: "handle_metadata_get",
+        MetadataDeleteRequest: "handle_metadata_delete",
+        MetadataListRequest: "handle_metadata_list",
+    }
 
-        Permission checks are delegated to the state machine.
-        """
-        if isinstance(msg, CommitRequest):
-            self._sm.check_operation(Operation.COMMIT, conn)
+    async def _dispatch(self, conn: Connection, msg) -> tuple[object, int, bool]:
+        """Dispatch request to handler. Returns (response, fd, should_close)."""
+        msg_type = type(msg)
+        self._sm.check_operation(msg_type, conn)
+
+        # Special cases
+        if msg_type is CommitRequest:
             return await self._handle_commit(conn)
 
-        if isinstance(msg, GetLockStateRequest):
-            self._sm.check_operation(Operation.GET_LOCK_STATE, conn)
-            return (
-                self._handler.handle_get_lock_state(
-                    self._sm.rw_conn is not None,
-                    self._sm.ro_count,
-                    self._waiting_writers,
-                    self._sm.committed,
-                ),
-                -1,
-                False,
-            )
+        if msg_type is GetLockStateRequest:
+            return self._handler.handle_get_lock_state(
+                self._sm.rw_conn is not None,
+                self._sm.ro_count,
+                self._waiting_writers,
+                self._sm.committed,
+            ), -1, False
 
-        if isinstance(msg, GetAllocationStateRequest):
-            self._sm.check_operation(Operation.GET_ALLOCATION_STATE, conn)
+        if msg_type is GetAllocationStateRequest:
             return self._handler.handle_get_allocation_state(), -1, False
 
-        if isinstance(msg, AllocateRequest):
-            self._sm.check_operation(Operation.ALLOCATE, conn)
-            return self._handler.handle_allocate(msg), -1, False
-
-        if isinstance(msg, ExportRequest):
-            self._sm.check_operation(Operation.EXPORT, conn)
+        if msg_type is ExportRequest:
             response, fd = self._handler.handle_export(msg.allocation_id)
             return response, fd, False
 
-        if isinstance(msg, GetAllocationRequest):
-            self._sm.check_operation(Operation.GET_ALLOCATION, conn)
-            return self._handler.handle_get_allocation(msg), -1, False
-
-        if isinstance(msg, ListAllocationsRequest):
-            self._sm.check_operation(Operation.LIST_ALLOCATIONS, conn)
-            return self._handler.handle_list_allocations(msg), -1, False
-
-        if isinstance(msg, FreeRequest):
-            self._sm.check_operation(Operation.FREE, conn)
-            return self._handler.handle_free(msg), -1, False
-
-        if isinstance(msg, ClearAllRequest):
-            self._sm.check_operation(Operation.CLEAR_ALL, conn)
+        if msg_type is ClearAllRequest:
             return self._handler.handle_clear_all(), -1, False
 
-        if isinstance(msg, MetadataPutRequest):
-            self._sm.check_operation(Operation.METADATA_PUT, conn)
-            return self._handler.handle_metadata_put(msg), -1, False
+        if msg_type is GetStateHashRequest:
+            return self._handler.handle_get_state_hash(), -1, False
 
-        if isinstance(msg, MetadataGetRequest):
-            self._sm.check_operation(Operation.METADATA_GET, conn)
-            return self._handler.handle_metadata_get(msg), -1, False
+        # Standard dispatch: handler takes msg, returns response
+        handler_name = self._HANDLERS.get(msg_type)
+        if handler_name:
+            handler = getattr(self._handler, handler_name)
+            return handler(msg), -1, False
 
-        if isinstance(msg, MetadataDeleteRequest):
-            self._sm.check_operation(Operation.METADATA_DELETE, conn)
-            return self._handler.handle_metadata_delete(msg), -1, False
-
-        if isinstance(msg, MetadataListRequest):
-            self._sm.check_operation(Operation.METADATA_LIST, conn)
-            return self._handler.handle_metadata_list(msg), -1, False
-
-        raise ValueError(f"Unknown request: {type(msg)}")
+        raise ValueError(f"Unknown request: {msg_type.__name__}")
 
     async def _handle_commit(self, conn: Connection) -> tuple[object, int, bool]:
         """Handle commit via state machine transition - atomic with disconnect."""
-        # Permission already checked in _dispatch
+        # Compute state hash before transitioning
+        self._handler.on_commit()
         # State transition: commit
         self._sm.transition(StateEvent.RW_COMMIT, conn)
 

@@ -1,91 +1,67 @@
-"""Request handlers for GPU Memory Service.
+"""Request handlers for GPU Memory Service."""
 
-Stateless handlers for allocation operations, metadata operations, and state
-queries. Separated from server to keep lifecycle/connection management distinct.
-"""
-
+import hashlib
 import logging
+from dataclasses import dataclass
 
-from gpu_memory_service.common.protocol import (
-    AllocateRequest,
-    AllocateResponse,
-    ClearAllResponse,
-    FreeRequest,
-    FreeResponse,
-    GetAllocationRequest,
-    GetAllocationResponse,
-    GetAllocationStateResponse,
-    GetLockStateResponse,
-    ListAllocationsRequest,
-    ListAllocationsResponse,
-    MetadataDeleteRequest,
-    MetadataDeleteResponse,
-    MetadataGetRequest,
-    MetadataGetResponse,
-    MetadataListRequest,
-    MetadataListResponse,
-    MetadataPutRequest,
-    MetadataPutResponse,
-)
+from gpu_memory_service.common.protocol.messages import *  # noqa: F401,F403
 from gpu_memory_service.common.types import derive_state
 
 from .memory_manager import AllocationNotFoundError, GMSServerMemoryManager
-from .metadata_store import GMSMetadataStore
 
 logger = logging.getLogger(__name__)
 
 
-class RequestHandler:
-    """Handles allocation and metadata requests.
+@dataclass(frozen=True)
+class MetadataEntry:
+    allocation_id: str
+    offset_bytes: int
+    value: bytes
 
-    This class contains all the business logic handlers, separate from
-    connection/lifecycle management. It is NOT thread-safe - the async
-    server ensures single-threaded access.
-    """
+
+class RequestHandler:
+    """Handles allocation and metadata requests."""
 
     def __init__(self, device: int = 0):
-        """Initialize handler with memory manager and metadata store.
-
-        Args:
-            device: CUDA device ID for allocations
-        """
         self._memory_manager = GMSServerMemoryManager(device)
-        self._metadata_store = GMSMetadataStore()
-
-        logger.info(
-            f"RequestHandler initialized: device={device}, "
-            f"granularity={self._memory_manager.granularity}"
-        )
+        self._metadata: dict[str, MetadataEntry] = {}
+        self._state_hash: str = ""  # Hash of allocations + metadata, computed on commit
+        logger.info(f"RequestHandler initialized: device={device}")
 
     @property
     def granularity(self) -> int:
-        """VMM allocation granularity."""
         return self._memory_manager.granularity
 
-    @property
-    def metadata_store(self) -> GMSMetadataStore:
-        """Metadata store."""
-        return self._metadata_store
-
-    # ==================== Lifecycle Callbacks ====================
-
     def on_rw_abort(self) -> None:
-        """Called when RW connection closes without commit.
-
-        Clears all allocations and metadata.
-        """
+        """Called when RW connection closes without commit."""
         logger.warning("RW aborted; clearing allocations and metadata")
         self._memory_manager.clear_all()
-        self._metadata_store.clear()
+        self._metadata.clear()
+        self._state_hash = ""
+
+    def on_commit(self) -> None:
+        """Called when RW connection commits. Computes state hash."""
+        self._state_hash = self._compute_state_hash()
+        logger.info(f"Committed with state hash: {self._state_hash[:16]}...")
+
+    def _compute_state_hash(self) -> str:
+        """Compute hash of current allocations + metadata."""
+        h = hashlib.sha256()
+        # Hash allocations (sorted by ID for determinism)
+        for info in sorted(self._memory_manager.list_allocations(), key=lambda x: x.allocation_id):
+            h.update(f"{info.allocation_id}:{info.size}:{info.aligned_size}:{info.tag}".encode())
+        # Hash metadata (sorted by key for determinism)
+        for key in sorted(self._metadata.keys()):
+            entry = self._metadata[key]
+            h.update(f"{key}:{entry.allocation_id}:{entry.offset_bytes}:".encode())
+            h.update(entry.value)
+        return h.hexdigest()
 
     def on_shutdown(self) -> None:
-        """Called on server shutdown.
-
-        Releases all GPU memory.
-        """
+        """Called on server shutdown."""
         if self._memory_manager.allocation_count > 0:
             count = self._memory_manager.clear_all()
-            self._metadata_store.clear()
+            self._metadata.clear()
             logger.info(f"Released {count} GPU allocations during shutdown")
 
     # ==================== State Queries ====================
@@ -192,21 +168,11 @@ class RequestHandler:
     # ==================== Metadata Operations ====================
 
     def handle_metadata_put(self, req: MetadataPutRequest) -> MetadataPutResponse:
-        """Put metadata entry.
-
-        Requires RW connection (enforced by server).
-        """
-        self._metadata_store.put(
-            key=req.key,
-            allocation_id=req.allocation_id,
-            offset_bytes=req.offset_bytes,
-            value=req.value,
-        )
+        self._metadata[req.key] = MetadataEntry(req.allocation_id, req.offset_bytes, req.value)
         return MetadataPutResponse(success=True)
 
     def handle_metadata_get(self, req: MetadataGetRequest) -> MetadataGetResponse:
-        """Get metadata entry."""
-        entry = self._metadata_store.get(req.key)
+        entry = self._metadata.get(req.key)
         if entry is None:
             return MetadataGetResponse(found=False)
         return MetadataGetResponse(
@@ -216,17 +182,12 @@ class RequestHandler:
             value=entry.value,
         )
 
-    def handle_metadata_delete(
-        self, req: MetadataDeleteRequest
-    ) -> MetadataDeleteResponse:
-        """Delete metadata entry.
-
-        Requires RW connection (enforced by server).
-        """
-        deleted = self._metadata_store.delete(req.key)
-        return MetadataDeleteResponse(deleted=deleted)
+    def handle_metadata_delete(self, req: MetadataDeleteRequest) -> MetadataDeleteResponse:
+        return MetadataDeleteResponse(deleted=self._metadata.pop(req.key, None) is not None)
 
     def handle_metadata_list(self, req: MetadataListRequest) -> MetadataListResponse:
-        """List metadata keys."""
-        keys = self._metadata_store.list_keys(req.prefix)
-        return MetadataListResponse(keys=keys)
+        keys = [k for k in self._metadata if k.startswith(req.prefix)] if req.prefix else list(self._metadata)
+        return MetadataListResponse(keys=sorted(keys))
+
+    def handle_get_state_hash(self) -> GetStateHashResponse:
+        return GetStateHashResponse(state_hash=self._state_hash)

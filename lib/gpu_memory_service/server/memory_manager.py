@@ -22,8 +22,6 @@ from gpu_memory_service.common.cuda_vmm_utils import (
     get_allocation_granularity,
 )
 
-__all__ = ["GMSServerMemoryManager", "AllocationInfo", "AllocationNotFoundError"]
-
 logger = logging.getLogger(__name__)
 
 
@@ -68,59 +66,41 @@ class GMSServerMemoryManager:
       driver failures.
     - NOT thread-safe: Callers must provide external synchronization.
       The GlobalLockFSM's RW/RO semantics ensure single-writer access.
-    - Lazy CUDA loading: CUDA library is loaded on first use.
-
-    Example:
-        manager = GMSServerMemoryManager(device=0)
-        info = manager.allocate(1024 * 1024, tag="weights")
-        fd = manager.export_fd(info.allocation_id)
-        # Send fd to client via SCM_RIGHTS
-        os.close(fd)  # Caller must close after sending
     """
 
     def __init__(self, device: int = 0):
-        """Initialize allocation manager for a CUDA device.
-
-        Args:
-            device: CUDA device index (default: 0)
-
-        Raises:
-            RuntimeError: If CUDA initialization fails
-        """
         self._device = device
         self._allocations: Dict[str, AllocationInfo] = {}
-
-        # Initialize CUDA and get granularity
         ensure_cuda_initialized()
         self._granularity = get_allocation_granularity(device)
-
-        logger.info(
-            f"GMSServerMemoryManager initialized: device={device}, granularity={self._granularity}"
-        )
+        logger.info(f"GMSServerMemoryManager initialized: device={device}, granularity={self._granularity}")
 
     @property
     def device(self) -> int:
-        """CUDA device index."""
         return self._device
 
     @property
     def granularity(self) -> int:
-        """VMM allocation granularity for this device (typically 2 MiB)."""
         return self._granularity
 
     @property
     def allocation_count(self) -> int:
-        """Number of active allocations."""
         return len(self._allocations)
 
     @property
     def total_bytes(self) -> int:
-        """Total aligned bytes across all allocations."""
         return sum(info.aligned_size for info in self._allocations.values())
 
-    def _align(self, size: int) -> int:
-        """Align size up to VMM granularity."""
-        return align_to_granularity(size, self._granularity)
+    def _get(self, allocation_id: str) -> AllocationInfo:
+        info = self._allocations.get(allocation_id)
+        if info is None:
+            raise AllocationNotFoundError(f"Unknown allocation: {allocation_id}")
+        return info
+
+    def _release(self, info: AllocationInfo) -> None:
+        (result,) = cuda.cuMemRelease(info.handle)
+        if result != cuda.CUresult.CUDA_SUCCESS:
+            logger.warning(f"cuMemRelease failed for {info.allocation_id}: {result}")
 
     def allocate(self, size: int, tag: str = "default") -> AllocationInfo:
         """Create a physical memory allocation (no VA mapping).
@@ -138,35 +118,27 @@ class GMSServerMemoryManager:
         Raises:
             RuntimeError: If CUDA allocation fails
         """
-        aligned_size = self._align(size)
+        aligned_size = align_to_granularity(size, self._granularity)
 
-        # Set up allocation properties for shareable handle
         prop = cuda.CUmemAllocationProp()
         prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self._device
-        prop.requestedHandleTypes = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
+        prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 
-        # Create physical allocation (no VA mapping!)
         result, handle = cuda.cuMemCreate(aligned_size, prop, 0)
         check_cuda_result(result, "cuMemCreate")
 
-        allocation_id = str(uuid4())
         info = AllocationInfo(
-            allocation_id=allocation_id,
+            allocation_id=str(uuid4()),
             size=size,
             aligned_size=aligned_size,
             handle=int(handle),
             tag=tag,
             created_at=time.time(),
         )
-        self._allocations[allocation_id] = info
-
-        logger.debug(
-            f"Allocated {allocation_id}: size={size}, aligned_size={aligned_size}, tag={tag}"
-        )
+        self._allocations[info.allocation_id] = info
+        logger.debug(f"Allocated {info.allocation_id}: size={size}, aligned={aligned_size}, tag={tag}")
         return info
 
     def export_fd(self, allocation_id: str) -> int:
@@ -189,10 +161,7 @@ class GMSServerMemoryManager:
             AllocationNotFoundError: If allocation_id doesn't exist
             RuntimeError: If CUDA export fails
         """
-        info = self._allocations.get(allocation_id)
-        if info is None:
-            raise AllocationNotFoundError(f"Unknown allocation: {allocation_id}")
-
+        info = self._get(allocation_id)
         result, fd = cuda.cuMemExportToShareableHandle(
             info.handle,
             cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
@@ -213,10 +182,7 @@ class GMSServerMemoryManager:
         info = self._allocations.pop(allocation_id, None)
         if info is None:
             return False
-
-        (result,) = cuda.cuMemRelease(info.handle)
-        if result != cuda.CUresult.CUDA_SUCCESS:
-            logger.warning(f"cuMemRelease failed for {allocation_id}: {result}")
+        self._release(info)
         logger.debug(f"Freed allocation: {allocation_id}")
         return True
 
@@ -231,41 +197,17 @@ class GMSServerMemoryManager:
         """
         count = len(self._allocations)
         for info in self._allocations.values():
-            (result,) = cuda.cuMemRelease(info.handle)
-            if result != cuda.CUresult.CUDA_SUCCESS:
-                logger.warning(
-                    f"cuMemRelease failed for {info.allocation_id}: {result}"
-                )
+            self._release(info)
         self._allocations.clear()
         logger.info(f"Cleared {count} allocations")
         return count
 
     def get_allocation(self, allocation_id: str) -> AllocationInfo:
-        """Get allocation info.
-
-        Args:
-            allocation_id: ID to look up
-
-        Returns:
-            AllocationInfo
-
-        Raises:
-            AllocationNotFoundError: If not found
-        """
-        info = self._allocations.get(allocation_id)
-        if info is None:
-            raise AllocationNotFoundError(f"Unknown allocation: {allocation_id}")
-        return info
+        """Get allocation info. Raises AllocationNotFoundError if not found."""
+        return self._get(allocation_id)
 
     def list_allocations(self, tag: Optional[str] = None) -> List[AllocationInfo]:
-        """List all allocations, optionally filtered by tag.
-
-        Args:
-            tag: If provided, only return allocations with this tag
-
-        Returns:
-            List of AllocationInfo objects
-        """
+        """List all allocations, optionally filtered by tag."""
         if tag is None:
             return list(self._allocations.values())
         return [info for info in self._allocations.values() if info.tag == tag]

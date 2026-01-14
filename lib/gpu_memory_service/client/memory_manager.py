@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional
 
 import torch
 from cuda.bindings import driver as cuda
@@ -64,17 +64,11 @@ class LocalMapping:
     tag: str
     access: Literal["ro", "rw"]
 
+    def with_handle(self, handle: int) -> "LocalMapping":
+        return LocalMapping(self.allocation_id, self.va, self.size, self.aligned_size, handle, self.tag, self.access)
 
-@dataclass(frozen=True)
-class PreservedMetadataSpec:
-    """Snapshot of metadata tensor spec for validation on wake."""
-
-    key: str
-    allocation_id: str
-    offset_bytes: int
-    shape: Tuple[int, ...]
-    dtype: str
-    stride: Optional[Tuple[int, ...]]
+    def with_access(self, access: Literal["ro", "rw"]) -> "LocalMapping":
+        return LocalMapping(self.allocation_id, self.va, self.size, self.aligned_size, self.handle, self.tag, access)
 
 
 class GMSClientMemoryManager:
@@ -110,8 +104,7 @@ class GMSClientMemoryManager:
 
         # VA-stable sleep/wake state
         self._va_preserved = False
-        self._preserved_metadata_prefix: Optional[str] = None
-        self._preserved_metadata_specs: Dict[str, PreservedMetadataSpec] = {}
+        self._last_state_hash: str = ""  # Hash from server, saved on connect/commit
 
         # Ensure torch is on the right device for subsequent CUDA operations.
         if torch.cuda.is_available():
@@ -132,15 +125,22 @@ class GMSClientMemoryManager:
             )
 
     def _connect(
-        self, *, lock_type: Literal["rw", "ro", "rw_or_ro"], timeout_ms: Optional[int]
+        self,
+        *,
+        lock_type: Literal["rw", "ro", "rw_or_ro"],
+        timeout_ms: Optional[int],
+        update_state_hash: bool = True,
     ) -> None:
         self._client = GMSRPCClient(
             self.socket_path, lock_type=lock_type, timeout_ms=timeout_ms
         )
         self._sleeping = False
         # Update mode based on granted lock type (may differ from requested for rw_or_ro)
-        granted = self._client.granted_lock_type
+        granted = self._client.lock_type
         self._mode = "write" if granted == "rw" else "read"
+        # Save state hash for stale detection on wake (skip during wake itself)
+        if update_state_hash and self._client.committed:
+            self._last_state_hash = self._client.get_state_hash()
 
     @property
     def mode(self) -> Literal["write", "read"]:
@@ -152,7 +152,7 @@ class GMSClientMemoryManager:
         if self._client is None:
             return None
         # Use granted lock type (may differ from requested for rw_or_ro mode)
-        granted = self._client.granted_lock_type
+        granted = self._client.lock_type
         return "rw" if granted == "rw" else "ro"
 
     @property
@@ -168,47 +168,27 @@ class GMSClientMemoryManager:
     def metadata_put(
         self, key: str, allocation_id: str, offset_bytes: int, value: bytes
     ) -> bool:
-        self._require_connected()
-        assert self._client is not None
-        return self._client.metadata_put(key, allocation_id, offset_bytes, value)
+        return self._client_rpc.metadata_put(key, allocation_id, offset_bytes, value)
 
     def metadata_get(self, key: str) -> Optional[tuple[str, int, bytes]]:
-        self._require_connected()
-        assert self._client is not None
-        return self._client.metadata_get(key)
+        return self._client_rpc.metadata_get(key)
 
     def metadata_list(self, prefix: str = "") -> List[str]:
-        self._require_connected()
-        assert self._client is not None
-        return self._client.metadata_list(prefix)
+        return self._client_rpc.metadata_list(prefix)
 
     def metadata_delete(self, key: str) -> bool:
-        self._require_connected()
-        assert self._client is not None
-        return self._client.metadata_delete(key)
+        return self._client_rpc.metadata_delete(key)
 
     def metadata_delete_prefix(self, prefix: str) -> int:
-        """Delete all metadata keys with prefix (RW only).
-
-        This is a convenience method that iterates over List(prefix) and
-        deletes each key individually.
-        """
-        self._require_connected()
-        assert self._client is not None
-        keys = self._client.metadata_list(prefix)
-        count = 0
-        for key in keys:
-            if self._client.metadata_delete(key):
-                count += 1
-        return count
+        """Delete all metadata keys with prefix (RW only)."""
+        client = self._client_rpc
+        return sum(1 for key in client.metadata_list(prefix) if client.metadata_delete(key))
 
     # ==================== Allocation operations ====================
 
     def list_allocations(self, tag: Optional[str] = None) -> List[Dict]:
         """List all allocations on the server."""
-        self._require_connected()
-        assert self._client is not None
-        return self._client.list_allocations(tag)
+        return self._client_rpc.list_allocations(tag)
 
     def allocate_to_va(
         self,
@@ -240,10 +220,8 @@ class GMSClientMemoryManager:
         Returns:
             allocation_id from the server
         """
-        self._require_connected()
-        if self.lock_type != "rw":
-            raise RuntimeError("allocate_to_va() requires RW mode")
-        assert self._client is not None
+        self._require_rw()
+        client = self._client_rpc
 
         # Import the C++ extension for import_and_map
         try:
@@ -257,14 +235,14 @@ class GMSClientMemoryManager:
             ) from e
 
         # Allocate on server
-        allocation_id, server_aligned = self._client.allocate(aligned_size, tag)
+        allocation_id, server_aligned = client.allocate(aligned_size, tag)
         if int(server_aligned) != int(aligned_size):
             raise RuntimeError(
                 f"Alignment mismatch: client={aligned_size} server={server_aligned}"
             )
 
         # Export FD and map to the pre-reserved VA
-        fd = self._client.export(allocation_id)
+        fd = client.export(allocation_id)
         try:
             # Map RW for writer
             cumem.import_and_map(
@@ -303,18 +281,16 @@ class GMSClientMemoryManager:
 
         In RO mode, maps read-only. In RW mode, maps read-write.
         """
-        self._require_connected()
-        assert self._client is not None
-
         if allocation_id in self._allocation_id_to_va:
             return self._allocation_id_to_va[allocation_id]
 
-        alloc_info = self._client.get_allocation(allocation_id)
-        aligned_size = int(alloc_info["aligned_size"])
-        size = int(alloc_info["size"])
-        tag = str(alloc_info.get("tag", "default"))
+        client = self._client_rpc
+        alloc_info = client.get_allocation(allocation_id)
+        aligned_size = int(alloc_info.aligned_size)
+        size = int(alloc_info.size)
+        tag = str(getattr(alloc_info, "tag", "default"))
 
-        fd = self._client.export(allocation_id)
+        fd = client.export(allocation_id)
         try:
             # Import the handle from the FD
             # C signature: cuMemImportFromShareableHandle(handle*, osHandle, handleType)
@@ -353,17 +329,10 @@ class GMSClientMemoryManager:
         return int(va)
 
     def clear_all(self) -> int:
-        """Clear all allocations on the server (RW only).
-
-        Local mappings are unmapped first.
-        """
-        self._require_connected()
-        if self.lock_type != "rw":
-            raise RuntimeError("clear_all() requires RW mode")
-        assert self._client is not None
-
+        """Clear all allocations on the server (RW only). Local mappings are unmapped first."""
+        self._require_rw()
         self._unmap_all()
-        return self._client.clear_all()
+        return self._client_rpc.clear_all()
 
     # ==================== Publish / mode switching ====================
 
@@ -378,10 +347,7 @@ class GMSClientMemoryManager:
         - transition to COMMITTED
         - close the RW socket (publish + release)
         """
-        self._require_connected()
-        if self.lock_type != "rw":
-            raise RuntimeError("commit() requires RW mode")
-        assert self._client is not None
+        self._require_rw()
 
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
@@ -390,18 +356,9 @@ class GMSClientMemoryManager:
         for va, m in list(self._mappings.items()):
             if m.access != "ro":
                 self._set_access(m.va, m.aligned_size, access="ro")
-                # Create new immutable LocalMapping with updated access
-                self._mappings[va] = LocalMapping(
-                    allocation_id=m.allocation_id,
-                    va=m.va,
-                    size=m.size,
-                    aligned_size=m.aligned_size,
-                    handle=m.handle,
-                    tag=m.tag,
-                    access="ro",
-                )
+                self._mappings[va] = m.with_access("ro")
 
-        ok = self._client.commit()
+        ok = self._client_rpc.commit()
         self._published = bool(ok)
         # _client.commit() closes the socket on success; reflect that here.
         if ok:
@@ -432,75 +389,32 @@ class GMSClientMemoryManager:
 
     # ==================== Sleep / wake (read mode) ====================
 
-    def sleep(self, *, metadata_prefix: Optional[str] = None) -> None:
+    def sleep(self) -> None:
         """Release RO lock and unmap local allocations (VA-stable).
 
         VAs are preserved during sleep so tensor pointers remain stable.
         On wake, allocations are remapped to the same VAs.
-
-        Args:
-            metadata_prefix: If provided, snapshot metadata specs for validation on wake.
-                            Typically the config_hash prefix (e.g., "abc123:").
         """
         if self._closed:
             raise RuntimeError("Memory manager is closed")
         if self._sleeping:
             return
-        self._require_connected()
         if self.lock_type != "ro":
             raise RuntimeError("sleep() requires RO mode")
 
-        # Ensure all device reads complete before unmapping and releasing the lock.
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
         # Preserve allocation IDs for remapping on wake
         self._preserved_allocation_ids = list(self._allocation_id_to_va.keys())
 
-        # Snapshot metadata specs for validation on wake (if prefix provided)
-        self._preserved_metadata_prefix = metadata_prefix
-        self._preserved_metadata_specs.clear()
-        if metadata_prefix is not None:
-            self._snapshot_metadata_specs(metadata_prefix)
-
         # Unmap physical memory but keep VA reservations
         self._unmap_preserving_va()
         self._va_preserved = True
 
-        assert self._client is not None
-        self._client.close()
+        self._client_rpc.close()
         self._client = None
         self._sleeping = True
-
-    def _snapshot_metadata_specs(self, prefix: str) -> None:
-        """Snapshot metadata tensor specs for validation on wake."""
-        assert self._client is not None
-        keys = self._client.metadata_list(prefix)
-        for key in keys:
-            got = self._client.metadata_get(key)
-            if got is None:
-                continue
-            allocation_id, offset_bytes, value = got
-            # Parse the value to extract shape, dtype, stride
-            try:
-                import json
-
-                obj = json.loads(value.decode("utf-8"))
-                shape = tuple(int(x) for x in obj.get("shape", []))
-                dtype = str(obj.get("dtype", ""))
-                stride = None
-                if "stride" in obj and obj["stride"] is not None:
-                    stride = tuple(int(x) for x in obj["stride"])
-                self._preserved_metadata_specs[key] = PreservedMetadataSpec(
-                    key=key,
-                    allocation_id=allocation_id,
-                    offset_bytes=offset_bytes,
-                    shape=shape,
-                    dtype=dtype,
-                    stride=stride,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to parse metadata spec for {key}: {e}")
 
     def wake(self, timeout_ms: Optional[int] = None) -> bool:
         """Reacquire RO lock and remap preserved allocations (VA-stable).
@@ -523,19 +437,18 @@ class GMSClientMemoryManager:
         if not self._sleeping:
             return True
 
-        # Ensure we're in the correct CUDA context before any operations
         if torch.cuda.is_available():
             torch.cuda.set_device(self.device)
-            logger.debug(
-                f"[GPU Memory Service] Set CUDA device to {self.device} for wake"
-            )
 
         eff_timeout = timeout_ms if timeout_ms is not None else self._timeout_ms
-        self._connect(lock_type="ro", timeout_ms=eff_timeout)
+        self._connect(lock_type="ro", timeout_ms=eff_timeout, update_state_hash=False)
 
-        # Validate metadata specs if we have preserved specs
-        if self._preserved_metadata_specs:
-            self._validate_metadata_specs()
+        # Check if state changed while sleeping
+        current_hash = self._client_rpc.get_state_hash()
+        if self._last_state_hash and current_hash != self._last_state_hash:
+            raise StaleWeightsError(
+                f"State changed while sleeping: hash {self._last_state_hash[:16]}... -> {current_hash[:16]}..."
+            )
 
         # Remap to preserved VAs
         remapped_count = 0
@@ -562,67 +475,7 @@ class GMSClientMemoryManager:
 
         self._sleeping = False
         self._va_preserved = False
-        self._preserved_metadata_specs.clear()
-        self._preserved_metadata_prefix = None
         return True
-
-    def _validate_metadata_specs(self) -> None:
-        """Validate metadata specs haven't changed structurally since sleep.
-
-        Raises StaleWeightsError if tensor structure changed.
-        """
-        assert self._client is not None
-        for key, preserved in self._preserved_metadata_specs.items():
-            got = self._client.metadata_get(key)
-            if got is None:
-                raise StaleWeightsError(f"Metadata key {key} no longer exists")
-
-            allocation_id, offset_bytes, value = got
-
-            # Check allocation_id matches
-            if allocation_id != preserved.allocation_id:
-                raise StaleWeightsError(
-                    f"Metadata key {key}: allocation_id changed from "
-                    f"{preserved.allocation_id} to {allocation_id}"
-                )
-
-            # Check offset matches
-            if offset_bytes != preserved.offset_bytes:
-                raise StaleWeightsError(
-                    f"Metadata key {key}: offset changed from "
-                    f"{preserved.offset_bytes} to {offset_bytes}"
-                )
-
-            # Parse and compare shape, dtype, stride
-            try:
-                import json
-
-                obj = json.loads(value.decode("utf-8"))
-                shape = tuple(int(x) for x in obj.get("shape", []))
-                dtype = str(obj.get("dtype", ""))
-                stride = None
-                if "stride" in obj and obj["stride"] is not None:
-                    stride = tuple(int(x) for x in obj["stride"])
-
-                if shape != preserved.shape:
-                    raise StaleWeightsError(
-                        f"Metadata key {key}: shape changed from "
-                        f"{preserved.shape} to {shape}"
-                    )
-                if dtype != preserved.dtype:
-                    raise StaleWeightsError(
-                        f"Metadata key {key}: dtype changed from "
-                        f"{preserved.dtype} to {dtype}"
-                    )
-                if stride != preserved.stride:
-                    raise StaleWeightsError(
-                        f"Metadata key {key}: stride changed from "
-                        f"{preserved.stride} to {stride}"
-                    )
-            except StaleWeightsError:
-                raise
-            except Exception as e:
-                logger.warning(f"Failed to validate metadata spec for {key}: {e}")
 
     # ==================== Cleanup ====================
 
@@ -644,8 +497,6 @@ class GMSClientMemoryManager:
         self._sleeping = False
         self._va_preserved = False
         self._preserved_allocation_ids.clear()
-        self._preserved_metadata_specs.clear()
-        self._preserved_metadata_prefix = None
 
     def __enter__(self) -> "GMSClientMemoryManager":
         return self
@@ -656,11 +507,19 @@ class GMSClientMemoryManager:
 
     # ==================== Internals ====================
 
-    def _require_connected(self) -> None:
+    @property
+    def _client_rpc(self) -> GMSRPCClient:
+        """Get connected client or raise. Use instead of _require_connected() + assert."""
         if self._client is None:
             if self._sleeping:
                 raise RuntimeError("Memory manager is sleeping")
             raise RuntimeError("Memory manager is not connected")
+        return self._client
+
+    def _require_rw(self) -> None:
+        """Raise if not in RW mode."""
+        if self.lock_type != "rw":
+            raise RuntimeError("Operation requires RW mode")
 
     def _track_mapping(self, m: LocalMapping) -> None:
         self._mappings[m.va] = m
@@ -691,37 +550,21 @@ class GMSClientMemoryManager:
             if mapping.handle == 0:
                 continue  # Already unmapped
             try:
-                # Unmap physical memory from VA
                 (result,) = cuda.cuMemUnmap(va, mapping.aligned_size)
                 if result != cuda.CUresult.CUDA_SUCCESS:
                     logger.warning(f"cuMemUnmap failed for VA 0x{va:x}: error {result}")
-                # Release the imported handle reference (we need to re-import on wake)
                 (result,) = cuda.cuMemRelease(mapping.handle)
                 if result != cuda.CUresult.CUDA_SUCCESS:
-                    logger.warning(
-                        f"cuMemRelease failed for handle {mapping.handle}: error {result}"
-                    )
-                # Create new LocalMapping with handle=0 to mark as unmapped but VA reserved
-                self._mappings[va] = LocalMapping(
-                    allocation_id=mapping.allocation_id,
-                    va=mapping.va,
-                    size=mapping.size,
-                    aligned_size=mapping.aligned_size,
-                    handle=0,  # Unmapped
-                    tag=mapping.tag,
-                    access=mapping.access,
-                )
+                    logger.warning(f"cuMemRelease failed for handle {mapping.handle}: error {result}")
+                self._mappings[va] = mapping.with_handle(0)  # Mark unmapped, VA reserved
                 unmapped_count += 1
                 total_bytes += mapping.aligned_size
             except Exception as e:
-                logger.warning(
-                    f"Error unmapping VA 0x{va:x} (preserving reservation): {e}"
-                )
+                logger.warning(f"Error unmapping VA 0x{va:x} (preserving reservation): {e}")
         logger.info(
-            f"[GPU Memory Service] Unmapped {unmapped_count} allocations ({total_bytes / (1 << 30):.2f} GiB), preserving {len(self._mappings)} VA reservations"
+            f"[GPU Memory Service] Unmapped {unmapped_count} allocations ({total_bytes / (1 << 30):.2f} GiB), "
+            f"preserving {len(self._mappings)} VA reservations"
         )
-        # Note: We do NOT clear _mappings or _allocation_id_to_va
-        # The VA reservations remain valid
 
     def _remap_preserved_va(self, allocation_id: str) -> int:
         """Remap an allocation to its preserved VA.
@@ -732,8 +575,6 @@ class GMSClientMemoryManager:
         Returns the VA.
         Raises StaleWeightsError if allocation is missing or size changed.
         """
-        # Ensure we're in the correct CUDA context for this device
-        # This is critical for driver API calls to work correctly
         if torch.cuda.is_available():
             torch.cuda.set_device(self.device)
 
@@ -748,25 +589,22 @@ class GMSClientMemoryManager:
         if mapping.handle != 0:
             return va  # Already mapped
 
-        assert self._client is not None
+        client = self._client_rpc
 
         # Validate allocation still exists and size matches
         try:
-            alloc_info = self._client.get_allocation(allocation_id)
+            alloc_info = client.get_allocation(allocation_id)
         except Exception as e:
-            raise StaleWeightsError(
-                f"Allocation {allocation_id} no longer exists on server: {e}"
-            ) from e
+            raise StaleWeightsError(f"Allocation {allocation_id} no longer exists on server: {e}") from e
 
-        server_aligned_size = int(alloc_info["aligned_size"])
+        server_aligned_size = int(alloc_info.aligned_size)
         if server_aligned_size != mapping.aligned_size:
             raise StaleWeightsError(
-                f"Allocation {allocation_id} size changed: "
-                f"expected {mapping.aligned_size}, got {server_aligned_size}"
+                f"Allocation {allocation_id} size changed: expected {mapping.aligned_size}, got {server_aligned_size}"
             )
 
         # Re-import the handle
-        fd = self._client.export(allocation_id)
+        fd = client.export(allocation_id)
         try:
             # C signature: cuMemImportFromShareableHandle(handle*, osHandle, handleType)
             # cuda-python: (osHandle, handleType) -> (result, handle)
@@ -809,16 +647,9 @@ class GMSClientMemoryManager:
                 f"[GPU Memory Service] Remapped VA 0x{va:x} validated OK (device={self.device})"
             )
 
-        # Update mapping with new handle
-        self._mappings[va] = LocalMapping(
-            allocation_id=mapping.allocation_id,
-            va=mapping.va,
-            size=mapping.size,
-            aligned_size=mapping.aligned_size,
-            handle=int(handle),
-            tag=mapping.tag,
-            access=access,
-        )
+        # Update mapping with new handle and access
+        updated = mapping.with_handle(int(handle))
+        self._mappings[va] = updated.with_access(access)
 
         return va
 

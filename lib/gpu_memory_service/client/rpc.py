@@ -30,40 +30,13 @@ Usage:
 
 import logging
 import socket
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
-from gpu_memory_service.common.protocol import (
-    AllocateRequest,
-    AllocateResponse,
-    ClearAllRequest,
-    ClearAllResponse,
-    CommitRequest,
-    CommitResponse,
-    ErrorResponse,
-    ExportRequest,
-    FreeRequest,
-    FreeResponse,
-    GetAllocationRequest,
-    GetAllocationResponse,
-    GetAllocationStateRequest,
-    GetAllocationStateResponse,
-    GetLockStateRequest,
-    GetLockStateResponse,
-    HandshakeRequest,
-    HandshakeResponse,
-    ListAllocationsRequest,
-    ListAllocationsResponse,
-    MetadataDeleteRequest,
-    MetadataDeleteResponse,
-    MetadataGetRequest,
-    MetadataGetResponse,
-    MetadataListRequest,
-    MetadataListResponse,
-    MetadataPutRequest,
-    MetadataPutResponse,
-    recv_message_sync,
-    send_message_sync,
-)
+from gpu_memory_service.common.protocol.messages import *  # noqa: F401,F403
+from gpu_memory_service.common.protocol.wire import *  # noqa: F401,F403
+from gpu_memory_service.common.types import RW_REQUIRED
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -176,20 +149,12 @@ class GMSRPCClient:
         return self._granted_lock_type
 
     @property
-    def granted_lock_type(self) -> Optional[str]:
-        """Alias for lock_type (for backwards compatibility)."""
-        return self._granted_lock_type
-
-    @property
     def is_connected(self) -> bool:
         """Check if client is connected."""
         return self._socket is not None
 
     def _send_recv(self, request) -> Tuple[object, int]:
-        """Send request and receive response.
-
-        Returns (response, fd) where fd is -1 if no FD received.
-        """
+        """Send request and receive response. Returns (response, fd)."""
         if not self._socket:
             raise RuntimeError("Client not connected")
 
@@ -203,38 +168,28 @@ class GMSRPCClient:
 
         return response, fd
 
-    # ==================== State Operations ====================
+    def _call(self, request, response_type: Type[T]) -> T:
+        """Send request, validate response type, return typed response."""
+        if type(request) in RW_REQUIRED and self.lock_type != "rw":
+            raise RuntimeError("Operation requires RW connection")
+        response, _ = self._send_recv(request)
+        if not isinstance(response, response_type):
+            raise RuntimeError(f"Unexpected response: {type(response)}")
+        return response
 
     def get_lock_state(self) -> GetLockStateResponse:
-        """Get lock/session state."""
-        response, _ = self._send_recv(GetLockStateRequest())
-        if not isinstance(response, GetLockStateResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        return response
+        return self._call(GetLockStateRequest(), GetLockStateResponse)
 
     def get_allocation_state(self) -> GetAllocationStateResponse:
-        """Get allocation state."""
-        response, _ = self._send_recv(GetAllocationStateRequest())
-        if not isinstance(response, GetAllocationStateResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        return response
+        return self._call(GetAllocationStateRequest(), GetAllocationStateResponse)
 
     def is_ready(self) -> bool:
-        """Check if server is ready (no RW, committed)."""
         return self.committed
 
-    # ==================== Commit Operation (RW only) ====================
-
     def commit(self) -> bool:
-        """Signal that weights are complete and valid.
-
-        Only valid for RW connections. After commit, the server closes
-        the connection and readers can acquire RO locks.
-
-        Returns True on success.
-        """
-        if self.lock_type != "rw":
-            raise RuntimeError("Only RW connections can commit")
+        """Commit weights and release RW lock. Returns True on success."""
+        if CommitRequest in RW_REQUIRED and self.lock_type != "rw":
+            raise RuntimeError("Operation requires RW connection")
 
         try:
             response, _ = self._send_recv(CommitRequest())
@@ -260,126 +215,50 @@ class GMSRPCClient:
 
         return False
 
-    # ==================== Allocation Operations ====================
-
     def allocate(self, size: int, tag: str = "default") -> Tuple[str, int]:
-        """Allocate physical memory (RW only).
-
-        Returns (allocation_id, aligned_size).
-        """
-        if self.lock_type != "rw":
-            raise RuntimeError("Only RW connections can allocate")
-
-        response, _ = self._send_recv(AllocateRequest(size=size, tag=tag))
-        if not isinstance(response, AllocateResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-
-        logger.debug(
-            f"Allocated {response.allocation_id}: {size} -> {response.aligned_size}"
-        )
-        return response.allocation_id, response.aligned_size
+        """Returns (allocation_id, aligned_size)."""
+        r = self._call(AllocateRequest(size=size, tag=tag), AllocateResponse)
+        return r.allocation_id, r.aligned_size
 
     def export(self, allocation_id: str) -> int:
-        """Export allocation as POSIX FD.
-
-        Caller is responsible for closing the FD when done.
-        """
-        response, fd = self._send_recv(ExportRequest(allocation_id=allocation_id))
+        """Export allocation as POSIX FD. Caller must close."""
+        _, fd = self._send_recv(ExportRequest(allocation_id=allocation_id))
         if fd < 0:
             raise RuntimeError("No FD received from server")
         return fd
 
-    def get_allocation(self, allocation_id: str) -> Dict:
-        """Get allocation info."""
-        response, _ = self._send_recv(GetAllocationRequest(allocation_id=allocation_id))
-        if not isinstance(response, GetAllocationResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-
-        return {
-            "allocation_id": response.allocation_id,
-            "size": response.size,
-            "aligned_size": response.aligned_size,
-            "tag": response.tag,
-        }
+    def get_allocation(self, allocation_id: str) -> GetAllocationResponse:
+        return self._call(GetAllocationRequest(allocation_id=allocation_id), GetAllocationResponse)
 
     def list_allocations(self, tag: Optional[str] = None) -> List[Dict]:
-        """List all allocations."""
-        response, _ = self._send_recv(ListAllocationsRequest(tag=tag))
-        if not isinstance(response, ListAllocationsResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        return response.allocations
+        return self._call(ListAllocationsRequest(tag=tag), ListAllocationsResponse).allocations
 
     def free(self, allocation_id: str) -> bool:
-        """Free a single allocation (RW only)."""
-        if self.lock_type != "rw":
-            raise RuntimeError("Only RW connections can free")
-
-        response, _ = self._send_recv(FreeRequest(allocation_id=allocation_id))
-        if isinstance(response, FreeResponse):
-            return response.success
-        return False
+        return self._call(FreeRequest(allocation_id=allocation_id), FreeResponse).success
 
     def clear_all(self) -> int:
-        """Clear all allocations (RW only)."""
-        if self.lock_type != "rw":
-            raise RuntimeError("Only RW connections can clear")
-
-        response, _ = self._send_recv(ClearAllRequest())
-        if not isinstance(response, ClearAllResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-
-        logger.info(f"Cleared {response.cleared_count} allocations")
-        return response.cleared_count
-
-    # ==================== Embedded Metadata Store ====================
+        return self._call(ClearAllRequest(), ClearAllResponse).cleared_count
 
     def metadata_put(
         self, key: str, allocation_id: str, offset_bytes: int, value: bytes
     ) -> bool:
-        """Put/update a metadata entry (RW only)."""
-        if self.lock_type != "rw":
-            raise RuntimeError("Only RW connections can mutate metadata")
-        response, _ = self._send_recv(
-            MetadataPutRequest(
-                key=key,
-                allocation_id=allocation_id,
-                offset_bytes=offset_bytes,
-                value=value,
-            )
-        )
-        if not isinstance(response, MetadataPutResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        return response.success
+        req = MetadataPutRequest(key=key, allocation_id=allocation_id, offset_bytes=offset_bytes, value=value)
+        return self._call(req, MetadataPutResponse).success
 
     def metadata_get(self, key: str) -> Optional[tuple[str, int, bytes]]:
-        """Get a metadata entry (RO or RW).
-
-        Returns (allocation_id, offset_bytes, value) or None if not found.
-        """
-        response, _ = self._send_recv(MetadataGetRequest(key=key))
-        if not isinstance(response, MetadataGetResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        if not response.found:
-            return None
-        return response.allocation_id, response.offset_bytes, response.value
+        """Returns (allocation_id, offset_bytes, value) or None if not found."""
+        r = self._call(MetadataGetRequest(key=key), MetadataGetResponse)
+        return (r.allocation_id, r.offset_bytes, r.value) if r.found else None
 
     def metadata_delete(self, key: str) -> bool:
-        """Delete a metadata entry (RW only)."""
-        if self.lock_type != "rw":
-            raise RuntimeError("Only RW connections can mutate metadata")
-        response, _ = self._send_recv(MetadataDeleteRequest(key=key))
-        if not isinstance(response, MetadataDeleteResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        return response.deleted
+        return self._call(MetadataDeleteRequest(key=key), MetadataDeleteResponse).deleted
 
     def metadata_list(self, prefix: str = "") -> List[str]:
-        """List metadata keys by prefix (RO or RW)."""
-        response, _ = self._send_recv(MetadataListRequest(prefix=prefix))
-        if not isinstance(response, MetadataListResponse):
-            raise RuntimeError(f"Unexpected response: {type(response)}")
-        return response.keys
+        return self._call(MetadataListRequest(prefix=prefix), MetadataListResponse).keys
 
-    # ==================== Connection Management ====================
+    def get_state_hash(self) -> str:
+        """Get state hash (hash of allocations + metadata). Empty if not committed."""
+        return self._call(GetStateHashRequest(), GetStateHashResponse).state_hash
 
     def close(self) -> None:
         """Close connection and release lock."""
