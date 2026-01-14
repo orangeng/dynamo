@@ -63,6 +63,7 @@ setup(
     packages=[
         "gpu_memory_service",
         "gpu_memory_service.common",
+        "gpu_memory_service.common.protocol",
         "gpu_memory_service.server",
         "gpu_memory_service.client",
         "gpu_memory_service.client.torch",
@@ -71,6 +72,7 @@ setup(
     package_dir={
         "gpu_memory_service": ".",
         "gpu_memory_service.common": "common",
+        "gpu_memory_service.common.protocol": "common/protocol",
         "gpu_memory_service.server": "server",
         "gpu_memory_service.client": "client",
         "gpu_memory_service.client.torch": "client/torch",

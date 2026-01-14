@@ -204,8 +204,10 @@ class GMSRPCClient:
             self.close()
             try:
                 ro = GMSRPCClient(self.socket_path, lock_type=RequestedLockType.RO, timeout_ms=1000)
-                ok = ro.committed
-                ro.close()
+                try:
+                    ok = ro.committed
+                finally:
+                    ro.close()
             except TimeoutError:
                 ok = False
 

@@ -435,10 +435,15 @@ class GMSClientMemoryManager:
                 logger.warning(f"Failed to remap {alloc_id}: {e}")
                 failed_count += 1
 
+        if failed_count > 0:
+            raise RuntimeError(
+                f"Wake failed: {failed_count} of {len(self._preserved_allocation_ids)} "
+                f"allocations could not be remapped"
+            )
+
         logger.info(
             f"[GPU Memory Service] Wake complete on device {self.device}: "
-            f"remapped {remapped_count} allocations ({total_bytes / (1 << 30):.2f} GiB), "
-            f"{failed_count} failed"
+            f"remapped {remapped_count} allocations ({total_bytes / (1 << 30):.2f} GiB)"
         )
 
         self._sleeping = False
@@ -471,7 +476,6 @@ class GMSClientMemoryManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
-        return False
 
     # ==================== Internals ====================
 
@@ -566,7 +570,7 @@ class GMSClientMemoryManager:
         cuda.cuCtxSynchronize()
 
         # Validate the pointer is accessible (this is what Triton checks)
-        result, dev_ptr = cuda.cuPointerGetAttribute(
+        result, _dev_ptr = cuda.cuPointerGetAttribute(
             cuda.CUpointer_attribute.CU_POINTER_ATTRIBUTE_DEVICE_POINTER, va
         )
         if result != cuda.CUresult.CUDA_SUCCESS:

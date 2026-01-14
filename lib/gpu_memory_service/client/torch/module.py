@@ -140,6 +140,17 @@ def register_module_tensors(
                     value=meta.to_bytes(),
                 )
                 break
+        else:
+            # No mapping matched - tensor pointer not in any GMS allocation
+            if tensor_type == "parameter":
+                # Parameters are model weights - must be in GMS allocations
+                raise RuntimeError(
+                    f"Tensor {name!r} not found in any GMS allocation"
+                )
+            # Buffers and tensor_attrs may be dynamically allocated (e.g., KV cache)
+            logger.debug(
+                "[GMS] Skipping %s %r - not in GMS allocations", tensor_type, name
+            )
 
 
 def materialize_module_from_gms(

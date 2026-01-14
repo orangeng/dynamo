@@ -51,12 +51,23 @@ def _tensor_from_pointer(
     """
     device = torch.device("cuda", device_index)
 
-    # Calculate storage size in bytes
-    numel = 1
-    for dim in shape:
-        numel *= dim
+    # Calculate storage size in bytes based on stride (handles non-contiguous tensors)
+    # For non-contiguous tensors, the memory footprint is larger than numel * element_size
     element_size = torch.tensor([], dtype=dtype).element_size()
-    storage_size_bytes = numel * element_size
+
+    if shape and stride:
+        if len(shape) != len(stride):
+            raise ValueError(
+                f"Shape and stride length mismatch: {len(shape)} vs {len(stride)}"
+            )
+        # Maximum offset = sum of stride[i] * (shape[i] - 1) for all dimensions
+        max_offset = sum(s * (d - 1) for s, d in zip(stride, shape) if d > 0)
+        required_elements = max_offset + 1
+    else:
+        # Scalar tensor or empty tensor
+        required_elements = 1
+
+    storage_size_bytes = required_elements * element_size
 
     # Create storage from raw pointer (does not take ownership)
     storage = torch._C._construct_storage_from_data_pointer(

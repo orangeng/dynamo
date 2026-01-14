@@ -50,7 +50,7 @@ def get_or_create_gms_client_memory_manager(
     from gpu_memory_service.client.memory_manager import GMSClientMemoryManager
 
     if _gms_client_memory_manager is not None:
-        return _get_existing(mode, device)
+        return _get_existing(mode)
 
     # Create new manager
     gms_client_memory_manager = GMSClientMemoryManager(
@@ -68,7 +68,7 @@ def get_or_create_gms_client_memory_manager(
 
 
 def _get_existing(
-    mode: RequestedLockType, device: int
+    mode: RequestedLockType,
 ) -> Tuple["GMSClientMemoryManager", Optional["MemPool"]]:
     """Return existing allocator if mode-compatible."""
     current = _gms_client_memory_manager.mode

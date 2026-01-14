@@ -127,7 +127,7 @@ TRANSITIONS: list[Transition] = [
     # From RW: commit publishes and transitions to COMMITTED
     # Writer publishes and releases lock
     Transition(
-        from_states=frozenset[ServerState]({ServerState.RW}),
+        from_states=frozenset({ServerState.RW}),
         event=StateEvent.RW_COMMIT,
         to_state=ServerState.COMMITTED,
     ),

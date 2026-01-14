@@ -53,7 +53,8 @@ def free_va(va: int, size: int) -> None:
         va: Virtual address to free.
         size: Size of the reservation.
     """
-    cuda.cuMemAddressFree(va, size)
+    (result,) = cuda.cuMemAddressFree(va, size)
+    check_cuda_result(result, "cuMemAddressFree")
 
 
 def map_to_va(va: int, size: int, handle: int) -> None:

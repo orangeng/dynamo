@@ -71,7 +71,7 @@ async def send_message(writer, msg: Message, fd: int = -1) -> None:
 
 
 async def recv_message(
-    reader, recv_buffer: bytearray = None, raw_sock=None
+    reader, recv_buffer: Optional[bytearray] = None, raw_sock=None
 ) -> Tuple[Optional[Message], int, bytearray]:
     """Receive a length-prefixed message with optional FD.
 
@@ -106,7 +106,13 @@ async def recv_message(
     # Try to extract message, read more if needed
     msg, remaining, bytes_needed = _try_extract_message(recv_buffer)
     while msg is None and bytes_needed > 0:
-        chunk = await reader.read(bytes_needed)
+        if raw_sock is not None:
+            # Continue reading from raw socket to avoid buffer inconsistency
+            chunk = await loop.run_in_executor(
+                None, lambda n=bytes_needed: raw_sock.recv(n)
+            )
+        else:
+            chunk = await reader.read(bytes_needed)
         if not chunk:
             raise ConnectionResetError("Connection closed")
         remaining.extend(chunk)
@@ -128,7 +134,7 @@ def send_message_sync(sock, msg: Message, fd: int = -1) -> None:
 
 
 def recv_message_sync(
-    sock, recv_buffer: bytearray = None
+    sock, recv_buffer: Optional[bytearray] = None
 ) -> Tuple[Optional[Message], int, bytearray]:
     """Receive a length-prefixed message with optional FD.
 
