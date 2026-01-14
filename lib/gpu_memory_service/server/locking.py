@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Set
 
 from gpu_memory_service.common.types import (
-    ConnectionMode,
+    GrantedLockType,
     ServerState,
     StateEvent,
     RW_ALLOWED,
@@ -59,7 +59,7 @@ class Connection:
 
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
-    mode: ConnectionMode
+    mode: GrantedLockType
     session_id: str
     recv_buffer: bytearray = field(default_factory=bytearray)
 
@@ -368,7 +368,7 @@ class GlobalLockFSM:
             )
 
         # Check connection mode
-        if msg_type in RW_REQUIRED and conn.mode != ConnectionMode.RW:
+        if msg_type in RW_REQUIRED and conn.mode != GrantedLockType.RW:
             raise OperationNotAllowed(
                 f"{msg_type.__name__} requires RW connection, "
                 f"but connection is {conn.mode.value}"

@@ -14,13 +14,6 @@ class ServerState(str, Enum):
     RO = "RO"
 
 
-class ConnectionMode(str, Enum):
-    """Connection lock mode."""
-    RW = "rw"
-    RO = "ro"
-    RW_OR_RO = "rw_or_ro"
-
-
 class StateEvent(Enum):
     """Events that trigger state transitions."""
     RW_CONNECT = auto()

@@ -22,7 +22,7 @@ from typing import Optional
 
 from gpu_memory_service.common.protocol.messages import *  # noqa: F401,F403
 from gpu_memory_service.common.protocol.wire import *  # noqa: F401,F403
-from gpu_memory_service.common.types import ConnectionMode, ServerState, StateEvent
+from gpu_memory_service.common.types import GrantedLockType, RequestedLockType, ServerState, StateEvent
 
 from .handler import RequestHandler
 from .locking import Connection, GlobalLockFSM
@@ -123,18 +123,9 @@ class GMSRPCServer:
             writer.close()
             return None
 
-        try:
-            requested_mode = ConnectionMode(msg.lock_type)
-        except ValueError:
-            await send_message(
-                writer, HandshakeResponse(success=False, committed=self._sm.committed)
-            )
-            writer.close()
-            return None
-
         # Acquire lock (blocks until available or timeout)
         # Returns the actual granted mode (may differ from requested for rw_or_ro)
-        granted_mode = await self._acquire_lock(requested_mode, msg.timeout_ms)
+        granted_mode = await self._acquire_lock(msg.lock_type, msg.timeout_ms)
         if granted_mode is None:
             await send_message(
                 writer, HandshakeResponse(success=False, committed=self._sm.committed)
@@ -147,7 +138,7 @@ class GMSRPCServer:
         # State transition: connect
         event = (
             StateEvent.RW_CONNECT
-            if granted_mode == ConnectionMode.RW
+            if granted_mode == GrantedLockType.RW
             else StateEvent.RO_CONNECT
         )
         self._sm.transition(event, conn)
@@ -157,22 +148,22 @@ class GMSRPCServer:
             HandshakeResponse(
                 success=True,
                 committed=self._sm.committed,
-                granted_lock_type=granted_mode.value,
+                granted_lock_type=granted_mode,
             ),
         )
         return conn
 
     async def _acquire_lock(
-        self, mode: ConnectionMode, timeout_ms: Optional[int]
-    ) -> Optional[ConnectionMode]:
+        self, mode: RequestedLockType, timeout_ms: Optional[int]
+    ) -> Optional[GrantedLockType]:
         """Wait until lock can be acquired (uses state machine predicates).
 
-        Returns the granted ConnectionMode, or None if failed/timeout.
+        Returns the granted lock type, or None if failed/timeout.
         For rw_or_ro mode, returns RW if available immediately, else waits for RO.
         """
         timeout = timeout_ms / 1000 if timeout_ms is not None else None
 
-        if mode == ConnectionMode.RW:
+        if mode == RequestedLockType.RW:
             self._waiting_writers += 1
             try:
                 async with self._condition:
@@ -183,13 +174,13 @@ class GMSRPCServer:
                             ),
                             timeout=timeout,
                         )
-                        return None if self._shutdown else ConnectionMode.RW
+                        return None if self._shutdown else GrantedLockType.RW
                     except asyncio.TimeoutError:
                         return None
             finally:
                 self._waiting_writers -= 1
 
-        elif mode == ConnectionMode.RO:
+        elif mode == RequestedLockType.RO:
             async with self._condition:
                 try:
                     await asyncio.wait_for(
@@ -199,18 +190,18 @@ class GMSRPCServer:
                         ),
                         timeout=timeout,
                     )
-                    return None if self._shutdown else ConnectionMode.RO
+                    return None if self._shutdown else GrantedLockType.RO
                 except asyncio.TimeoutError:
                     return None
 
-        elif mode == ConnectionMode.RW_OR_RO:
+        elif mode == RequestedLockType.RW_OR_RO:
             # Auto mode: try RW if available immediately AND no committed weights,
             # otherwise wait for RO (to import existing weights)
             async with self._condition:
                 # Check if RW is available AND no committed weights exist
                 # If weights are already committed, prefer RO to import them
                 if self._sm.can_acquire_rw() and not self._sm.committed:
-                    return ConnectionMode.RW
+                    return GrantedLockType.RW
 
                 # Either RW not available OR weights already committed - wait for RO
                 if self._sm.committed:
@@ -230,9 +221,10 @@ class GMSRPCServer:
                         ),
                         timeout=timeout,
                     )
-                    return None if self._shutdown else ConnectionMode.RO
+                    return None if self._shutdown else GrantedLockType.RO
                 except asyncio.TimeoutError:
                     return None
+        return None
 
     async def _cleanup_connection(
         self, conn: Optional[Connection], session_id: str
@@ -242,7 +234,7 @@ class GMSRPCServer:
             return
 
         # State transition: disconnect
-        if conn.mode == ConnectionMode.RW:
+        if conn.mode == GrantedLockType.RW:
             if self._sm.rw_conn is conn and not self._sm.committed:
                 # RW abort - state machine callback handles cleanup
                 self._sm.transition(StateEvent.RW_ABORT, conn)
@@ -333,7 +325,7 @@ class GMSRPCServer:
             return self._handler.handle_clear_all(), -1, False
 
         if msg_type is GetStateHashRequest:
-            return self._handler.handle_get_state_hash(), -1, False
+            return self._handler.handle_get_memory_layout_hash(), -1, False
 
         # Standard dispatch: handler takes msg, returns response
         handler_name = self._HANDLERS.get(msg_type)

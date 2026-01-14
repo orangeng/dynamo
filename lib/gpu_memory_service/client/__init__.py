@@ -14,12 +14,12 @@ For PyTorch integration (MemPool, tensor utilities), see gpu_memory_service.clie
 
 from gpu_memory_service.client.memory_manager import (
     GMSClientMemoryManager,
-    StaleWeightsError,
+    StaleMemoryLayoutError,
 )
 from gpu_memory_service.client.rpc import GMSRPCClient
 
 __all__ = [
     "GMSClientMemoryManager",
-    "StaleWeightsError",
+    "StaleMemoryLayoutError",
     "GMSRPCClient",
 ]

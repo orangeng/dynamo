@@ -22,31 +22,45 @@ This module uses cuda-python bindings for CUDA driver API calls:
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Optional
 
 import torch
 from cuda.bindings import driver as cuda
+from gpu_memory_service.client.cuda_vmm_utils import (
+    free_va,
+    import_handle_from_fd,
+    map_to_va,
+    release_handle,
+    reserve_va,
+    set_access,
+    unmap,
+)
 from gpu_memory_service.client.rpc import GMSRPCClient
 from gpu_memory_service.common.cuda_vmm_utils import (
-    check_cuda_result,
+    align_to_granularity,
     get_allocation_granularity,
 )
+from gpu_memory_service.common.types import GrantedLockType, RequestedLockType
 
 logger = logging.getLogger(__name__)
 
 
-class StaleWeightsError(Exception):
-    """Raised when weight structure was changed while sleeping.
+class StaleMemoryLayoutError(Exception):
+    """Raised when memory layout was modified while sleeping.
 
-    This error indicates that a writer acquired the RW lock and modified the
-    allocations (different sizes, different tensor layouts) while this reader
-    was sleeping. The caller should re-import the model from scratch.
+    This error indicates that a writer acquired the RW lock and changed the
+    allocation structure (different sizes, different tensor layouts) while this
+    reader was sleeping. The caller should re-import the model from scratch.
 
-    Note: This does NOT detect content-only changes. A writer can update tensor
-    values (e.g., for post-training/fine-tuning) without triggering this error.
-    The validation only detects structural changes that would invalidate pointers.
+    IMPORTANT: This is a LAYOUT check, NOT a CONTENT check.
+    - Detected: Allocation sizes changed, tensors added/removed, metadata structure changed
+    - NOT detected: Weight values modified in-place
+
+    This design is intentional: sleep/wake enables use cases like RL training
+    where another process can write to the same memory locations (e.g., updating
+    weights) while preserving the structure. As long as the layout (allocation
+    and metadata table hashes) remains identical, wake() succeeds.
     """
 
     pass
@@ -62,12 +76,12 @@ class LocalMapping:
     aligned_size: int
     handle: int  # 0 if unmapped but VA reserved
     tag: str
-    access: Literal["ro", "rw"]
+    access: GrantedLockType
 
     def with_handle(self, handle: int) -> "LocalMapping":
         return LocalMapping(self.allocation_id, self.va, self.size, self.aligned_size, handle, self.tag, self.access)
 
-    def with_access(self, access: Literal["ro", "rw"]) -> "LocalMapping":
+    def with_access(self, access: GrantedLockType) -> "LocalMapping":
         return LocalMapping(self.allocation_id, self.va, self.size, self.aligned_size, self.handle, self.tag, access)
 
 
@@ -75,16 +89,16 @@ class GMSClientMemoryManager:
     """Unified memory manager that can act as writer or reader.
 
     Modes:
-    - mode="write": acquire RW lock, allocate/map RW, mutate metadata, commit/publish.
-    - mode="read": acquire RO lock (READY only), import/map RO, sleep/wake.
-    - mode="auto": try RW if available, else wait for RO (for multiprocess architectures).
+    - mode=RequestedLockType.RW: acquire RW lock, allocate/map RW, mutate metadata, commit/publish.
+    - mode=RequestedLockType.RO: acquire RO lock (READY only), import/map RO, sleep/wake.
+    - mode=RequestedLockType.RW_OR_RO: try RW if available, else wait for RO.
     """
 
     def __init__(
         self,
         socket_path: str,
         *,
-        mode: Literal["write", "read", "auto"],
+        mode: RequestedLockType,
         device: int = 0,
         timeout_ms: Optional[int] = None,
     ) -> None:
@@ -100,11 +114,11 @@ class GMSClientMemoryManager:
         self._closed = False
         self._preserved_allocation_ids: List[str] = []
         self._published = False
-        self._mode: Literal["write", "read"] = "read"  # Updated by _connect
+        self._mode: Optional[GrantedLockType] = None  # Updated by _connect
 
         # VA-stable sleep/wake state
         self._va_preserved = False
-        self._last_state_hash: str = ""  # Hash from server, saved on connect/commit
+        self._last_memory_layout_hash: str = ""  # Hash from server, saved on connect/commit
 
         # Ensure torch is on the right device for subsequent CUDA operations.
         if torch.cuda.is_available():
@@ -113,47 +127,36 @@ class GMSClientMemoryManager:
         # Cache granularity for VA alignment
         self.granularity = get_allocation_granularity(device)
 
-        if mode == "write":
-            self._connect(lock_type="rw", timeout_ms=timeout_ms)
-        elif mode == "read":
-            self._connect(lock_type="ro", timeout_ms=timeout_ms)
-        elif mode == "auto":
-            self._connect(lock_type="rw_or_ro", timeout_ms=timeout_ms)
-        else:
-            raise ValueError(
-                f"Unknown mode: {mode}. Must be 'write', 'read', or 'auto'."
-            )
+        self._connect(lock_type=mode, timeout_ms=timeout_ms)
 
     def _connect(
         self,
         *,
-        lock_type: Literal["rw", "ro", "rw_or_ro"],
+        lock_type: RequestedLockType,
         timeout_ms: Optional[int],
-        update_state_hash: bool = True,
+        update_memory_layout_hash: bool = True,
     ) -> None:
         self._client = GMSRPCClient(
             self.socket_path, lock_type=lock_type, timeout_ms=timeout_ms
         )
         self._sleeping = False
         # Update mode based on granted lock type (may differ from requested for rw_or_ro)
-        granted = self._client.lock_type
-        self._mode = "write" if granted == "rw" else "read"
+        self._mode = self._client.lock_type
         # Save state hash for stale detection on wake (skip during wake itself)
-        if update_state_hash and self._client.committed:
-            self._last_state_hash = self._client.get_state_hash()
+        if update_memory_layout_hash and self._client.committed:
+            self._last_memory_layout_hash = self._client.get_memory_layout_hash()
 
     @property
-    def mode(self) -> Literal["write", "read"]:
+    def mode(self) -> Optional[GrantedLockType]:
         """Current mode of the memory manager."""
         return self._mode
 
     @property
-    def lock_type(self) -> Optional[Literal["rw", "ro"]]:
+    def lock_type(self) -> Optional[GrantedLockType]:
+        """Get the lock type actually granted by the server."""
         if self._client is None:
             return None
-        # Use granted lock type (may differ from requested for rw_or_ro mode)
-        granted = self._client.lock_type
-        return "rw" if granted == "rw" else "ro"
+        return self._client.lock_type
 
     @property
     def is_connected(self) -> bool:
@@ -162,6 +165,16 @@ class GMSClientMemoryManager:
     @property
     def is_sleeping(self) -> bool:
         return self._sleeping
+
+    @property
+    def mappings(self) -> Dict[int, LocalMapping]:
+        """Read-only view of VA -> LocalMapping dictionary."""
+        return self._mappings
+
+    @property
+    def total_bytes(self) -> int:
+        """Total bytes allocated across all mappings."""
+        return sum(m.aligned_size for m in self._mappings.values())
 
     # ==================== Metadata convenience ====================
 
@@ -179,102 +192,72 @@ class GMSClientMemoryManager:
     def metadata_delete(self, key: str) -> bool:
         return self._client_rpc.metadata_delete(key)
 
-    def metadata_delete_prefix(self, prefix: str) -> int:
-        """Delete all metadata keys with prefix (RW only)."""
-        client = self._client_rpc
-        return sum(1 for key in client.metadata_list(prefix) if client.metadata_delete(key))
-
     # ==================== Allocation operations ====================
 
     def list_allocations(self, tag: Optional[str] = None) -> List[Dict]:
         """List all allocations on the server."""
         return self._client_rpc.list_allocations(tag)
 
-    def allocate_to_va(
-        self,
-        size: int,
-        va: int,
-        aligned_size: int,
-        device: int,
-        tag: str = "default",
-    ) -> str:
-        """Allocate on server and map to a pre-reserved VA.
-
-        This method is used for integration with PyTorch's CUDAPluggableAllocator
-        where the C++ extension reserves VA before calling this method.
-
-        The C++ extension's my_malloc() reserves VA first, then calls the Python
-        callback which should use this method to:
-        1. Allocate physical memory on the server
-        2. Export the FD
-        3. Import and map to the pre-reserved VA via cumem.import_and_map()
-        4. Track the mapping in Python for sleep/wake
+    def allocate_and_map(self, size: int, tag: str = "default") -> int:
+        """Allocate on server, reserve VA, and map locally.
 
         Args:
-            size: Original requested size
-            va: Pre-reserved virtual address from C++ extension
-            aligned_size: Aligned size matching the VA reservation
-            device: CUDA device index
-            tag: Allocation tag
+            size: Requested allocation size in bytes.
+            tag: Allocation tag for server tracking.
 
         Returns:
-            allocation_id from the server
+            Virtual address of the mapped allocation.
         """
         self._require_rw()
         client = self._client_rpc
+        aligned_size = align_to_granularity(size, self.granularity)
 
-        # Import the C++ extension for import_and_map
+        va = reserve_va(aligned_size, self.granularity)
         try:
-            from gpu_memory_service.client.torch.extensions import (
-                _allocator_ext as cumem,
-            )
-        except ImportError as e:
-            raise RuntimeError(
-                "Missing CUDA VMM pluggable allocator extension. "
-                "Build gpu_memory_service with extensions first."
-            ) from e
+            allocation_id, server_aligned = client.allocate(aligned_size, tag)
+            if int(server_aligned) != aligned_size:
+                raise RuntimeError(f"Alignment mismatch: {aligned_size} vs {server_aligned}")
 
-        # Allocate on server
-        allocation_id, server_aligned = client.allocate(aligned_size, tag)
-        if int(server_aligned) != int(aligned_size):
-            raise RuntimeError(
-                f"Alignment mismatch: client={aligned_size} server={server_aligned}"
-            )
+            fd = client.export(allocation_id)
+            handle = import_handle_from_fd(fd)
+            map_to_va(va, aligned_size, handle)
+            set_access(va, aligned_size, self.device, GrantedLockType.RW)
 
-        # Export FD and map to the pre-reserved VA
-        fd = client.export(allocation_id)
-        try:
-            # Map RW for writer
-            cumem.import_and_map(
-                int(va), int(fd), int(aligned_size), int(device), False
-            )
-        finally:
-            os.close(fd)
-
-        # Get the handle from the C++ extension for tracking
-        # cumem stores handle internally, but we need it for LocalMapping
-        # Query the allocation info from cumem
-        alloc_infos = cumem.get_all_allocations()
-        handle = 0
-        for info in alloc_infos:
-            if int(info[0]) == int(va):
-                handle = int(info[3])
-                break
-
-        # Track in Python memory manager for sleep/wake
-        self._track_mapping(
-            LocalMapping(
+            self._track_mapping(LocalMapping(
                 allocation_id=allocation_id,
                 va=va,
                 size=size,
                 aligned_size=aligned_size,
                 handle=handle,
                 tag=tag,
-                access="rw",
-            )
-        )
+                access=GrantedLockType.RW,
+            ))
+            return va
+        except Exception:
+            free_va(va, aligned_size)
+            raise
 
-        return allocation_id
+    def free_mapping(self, va: int) -> None:
+        """Unmap and free a local mapping."""
+        mapping = self._mappings.pop(va, None)
+        if mapping is None:
+            return
+
+        self._allocation_id_to_va.pop(mapping.allocation_id, None)
+
+        try:
+            if mapping.handle != 0:
+                unmap(va, mapping.aligned_size)
+                release_handle(mapping.handle)
+            free_va(va, mapping.aligned_size)
+        except Exception as e:
+            logger.warning(f"Error freeing VA 0x{va:x}: {e}")
+
+        if self.lock_type == GrantedLockType.RW and not self._published:
+            try:
+                self._client_rpc.free(mapping.allocation_id)
+            except Exception:
+                pass
 
     def import_allocation(self, allocation_id: str) -> int:
         """Import an existing allocation and map locally.
@@ -290,43 +273,28 @@ class GMSClientMemoryManager:
         size = int(alloc_info.size)
         tag = str(getattr(alloc_info, "tag", "default"))
 
-        fd = client.export(allocation_id)
+        va = reserve_va(aligned_size, self.granularity)
         try:
-            # Import the handle from the FD
-            # C signature: cuMemImportFromShareableHandle(handle*, osHandle, handleType)
-            # cuda-python: (osHandle, handleType) -> (result, handle)
-            result, handle = cuda.cuMemImportFromShareableHandle(
-                fd,
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+            fd = client.export(allocation_id)
+            handle = import_handle_from_fd(fd)
+            map_to_va(va, aligned_size, handle)
+            set_access(va, aligned_size, self.device, self.lock_type)
+
+            self._track_mapping(
+                LocalMapping(
+                    allocation_id=allocation_id,
+                    va=va,
+                    size=size,
+                    aligned_size=aligned_size,
+                    handle=handle,
+                    tag=tag,
+                    access=self.lock_type,
+                )
             )
-            check_cuda_result(result, "cuMemImportFromShareableHandle")
-        finally:
-            os.close(fd)
-
-        # Reserve VA
-        result, va = cuda.cuMemAddressReserve(aligned_size, self.granularity, 0, 0)
-        check_cuda_result(result, "cuMemAddressReserve")
-
-        # Map the handle to the VA
-        (result,) = cuda.cuMemMap(va, aligned_size, 0, handle, 0)
-        check_cuda_result(result, "cuMemMap")
-
-        access: Literal["ro", "rw"] = "rw" if self.lock_type == "rw" else "ro"
-        self._set_access(int(va), aligned_size, access=access)
-
-        self._track_mapping(
-            LocalMapping(
-                allocation_id=allocation_id,
-                va=int(va),
-                size=size,
-                aligned_size=aligned_size,
-                handle=int(handle),
-                tag=tag,
-                access=access,
-            )
-        )
-
-        return int(va)
+            return va
+        except Exception:
+            free_va(va, aligned_size)
+            raise
 
     def clear_all(self) -> int:
         """Clear all allocations on the server (RW only). Local mappings are unmapped first."""
@@ -354,9 +322,9 @@ class GMSClientMemoryManager:
 
         # After publishing, prevent further writes locally.
         for va, m in list(self._mappings.items()):
-            if m.access != "ro":
-                self._set_access(m.va, m.aligned_size, access="ro")
-                self._mappings[va] = m.with_access("ro")
+            if m.access != GrantedLockType.RO:
+                set_access(m.va, m.aligned_size, self.device, GrantedLockType.RO)
+                self._mappings[va] = m.with_access(GrantedLockType.RO)
 
         ok = self._client_rpc.commit()
         self._published = bool(ok)
@@ -378,14 +346,14 @@ class GMSClientMemoryManager:
                 "Cannot switch_to_read() while sleeping; call wake() first"
             )
         if self._client is not None:
-            if self.lock_type == "ro":
+            if self.lock_type == GrantedLockType.RO:
                 return
             raise RuntimeError(
                 "switch_to_read() requires the RW connection to be released (call commit() first)"
             )
 
         eff_timeout = timeout_ms if timeout_ms is not None else self._timeout_ms
-        self._connect(lock_type="ro", timeout_ms=eff_timeout)
+        self._connect(lock_type=RequestedLockType.RO, timeout_ms=eff_timeout)
 
     # ==================== Sleep / wake (read mode) ====================
 
@@ -399,7 +367,7 @@ class GMSClientMemoryManager:
             raise RuntimeError("Memory manager is closed")
         if self._sleeping:
             return
-        if self.lock_type != "ro":
+        if self.lock_type != GrantedLockType.RO:
             raise RuntimeError("sleep() requires RO mode")
 
         if torch.cuda.is_available():
@@ -430,7 +398,7 @@ class GMSClientMemoryManager:
 
         Raises:
             TimeoutError: If timeout_ms expires waiting for RO lock.
-            StaleWeightsError: If weights were structurally changed while sleeping.
+            StaleMemoryLayoutError: If weights were structurally changed while sleeping.
         """
         if self._closed:
             raise RuntimeError("Memory manager is closed")
@@ -441,13 +409,13 @@ class GMSClientMemoryManager:
             torch.cuda.set_device(self.device)
 
         eff_timeout = timeout_ms if timeout_ms is not None else self._timeout_ms
-        self._connect(lock_type="ro", timeout_ms=eff_timeout, update_state_hash=False)
+        self._connect(lock_type=RequestedLockType.RO, timeout_ms=eff_timeout, update_memory_layout_hash=False)
 
-        # Check if state changed while sleeping
-        current_hash = self._client_rpc.get_state_hash()
-        if self._last_state_hash and current_hash != self._last_state_hash:
-            raise StaleWeightsError(
-                f"State changed while sleeping: hash {self._last_state_hash[:16]}... -> {current_hash[:16]}..."
+        # Check if memory layout changed while sleeping
+        current_hash = self._client_rpc.get_memory_layout_hash()
+        if self._last_memory_layout_hash and current_hash != self._last_memory_layout_hash:
+            raise StaleMemoryLayoutError(
+                f"State changed while sleeping: hash {self._last_memory_layout_hash[:16]}... -> {current_hash[:16]}..."
             )
 
         # Remap to preserved VAs
@@ -461,8 +429,8 @@ class GMSClientMemoryManager:
                 if mapping:
                     total_bytes += mapping.aligned_size
                 remapped_count += 1
-            except StaleWeightsError:
-                raise  # Let StaleWeightsError propagate
+            except StaleMemoryLayoutError:
+                raise  # Let StaleMemoryLayoutError propagate
             except Exception as e:
                 logger.warning(f"Failed to remap {alloc_id}: {e}")
                 failed_count += 1
@@ -518,25 +486,12 @@ class GMSClientMemoryManager:
 
     def _require_rw(self) -> None:
         """Raise if not in RW mode."""
-        if self.lock_type != "rw":
+        if self.lock_type != GrantedLockType.RW:
             raise RuntimeError("Operation requires RW mode")
 
     def _track_mapping(self, m: LocalMapping) -> None:
         self._mappings[m.va] = m
         self._allocation_id_to_va[m.allocation_id] = m.va
-
-    def _set_access(self, va: int, size: int, *, access: Literal["ro", "rw"]) -> None:
-        acc = cuda.CUmemAccessDesc()
-        acc.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-        acc.location.id = self.device
-        acc.flags = (
-            cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READ
-            if access == "ro"
-            else cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        )
-        # cuda-python expects a list of access descriptors, not a single object
-        (result,) = cuda.cuMemSetAccess(va, size, [acc], 1)
-        check_cuda_result(result, "cuMemSetAccess")
 
     def _unmap_preserving_va(self) -> None:
         """Unmap physical memory but PRESERVE VA reservations for sleep/wake.
@@ -550,12 +505,8 @@ class GMSClientMemoryManager:
             if mapping.handle == 0:
                 continue  # Already unmapped
             try:
-                (result,) = cuda.cuMemUnmap(va, mapping.aligned_size)
-                if result != cuda.CUresult.CUDA_SUCCESS:
-                    logger.warning(f"cuMemUnmap failed for VA 0x{va:x}: error {result}")
-                (result,) = cuda.cuMemRelease(mapping.handle)
-                if result != cuda.CUresult.CUDA_SUCCESS:
-                    logger.warning(f"cuMemRelease failed for handle {mapping.handle}: error {result}")
+                unmap(va, mapping.aligned_size)
+                release_handle(mapping.handle)
                 self._mappings[va] = mapping.with_handle(0)  # Mark unmapped, VA reserved
                 unmapped_count += 1
                 total_bytes += mapping.aligned_size
@@ -573,7 +524,7 @@ class GMSClientMemoryManager:
         Validates allocation still exists and size matches.
 
         Returns the VA.
-        Raises StaleWeightsError if allocation is missing or size changed.
+        Raises StaleMemoryLayoutError if allocation is missing or size changed.
         """
         if torch.cuda.is_available():
             torch.cuda.set_device(self.device)
@@ -595,34 +546,21 @@ class GMSClientMemoryManager:
         try:
             alloc_info = client.get_allocation(allocation_id)
         except Exception as e:
-            raise StaleWeightsError(f"Allocation {allocation_id} no longer exists on server: {e}") from e
+            raise StaleMemoryLayoutError(f"Allocation {allocation_id} no longer exists on server: {e}") from e
 
         server_aligned_size = int(alloc_info.aligned_size)
         if server_aligned_size != mapping.aligned_size:
-            raise StaleWeightsError(
+            raise StaleMemoryLayoutError(
                 f"Allocation {allocation_id} size changed: expected {mapping.aligned_size}, got {server_aligned_size}"
             )
 
-        # Re-import the handle
+        # Re-import the handle and map to the SAME VA (which is still reserved)
         fd = client.export(allocation_id)
-        try:
-            # C signature: cuMemImportFromShareableHandle(handle*, osHandle, handleType)
-            # cuda-python: (osHandle, handleType) -> (result, handle)
-            result, handle = cuda.cuMemImportFromShareableHandle(
-                fd,
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-            )
-            check_cuda_result(result, "cuMemImportFromShareableHandle")
-        finally:
-            os.close(fd)
-
-        # Map to the SAME VA (which is still reserved)
-        (result,) = cuda.cuMemMap(va, mapping.aligned_size, 0, handle, 0)
-        check_cuda_result(result, "cuMemMap")
+        handle = import_handle_from_fd(fd)
+        map_to_va(va, mapping.aligned_size, handle)
 
         # Set access permissions based on current lock type
-        access: Literal["ro", "rw"] = "rw" if self.lock_type == "rw" else "ro"
-        self._set_access(va, mapping.aligned_size, access=access)
+        set_access(va, mapping.aligned_size, self.device, self.lock_type)
 
         # Synchronize to ensure mapping is complete before any access
         cuda.cuCtxSynchronize()
@@ -648,8 +586,8 @@ class GMSClientMemoryManager:
             )
 
         # Update mapping with new handle and access
-        updated = mapping.with_handle(int(handle))
-        self._mappings[va] = updated.with_access(access)
+        updated = mapping.with_handle(handle)
+        self._mappings[va] = updated.with_access(self.lock_type)
 
         return va
 
@@ -658,9 +596,9 @@ class GMSClientMemoryManager:
         for va, mapping in list(self._mappings.items()):
             try:
                 if mapping.handle != 0:
-                    cuda.cuMemUnmap(va, mapping.aligned_size)
-                    cuda.cuMemRelease(mapping.handle)
-                cuda.cuMemAddressFree(va, mapping.aligned_size)
+                    unmap(va, mapping.aligned_size)
+                    release_handle(mapping.handle)
+                free_va(va, mapping.aligned_size)
             except Exception as e:
                 logger.warning(f"Error unmapping VA 0x{va:x}: {e}")
         self._mappings.clear()

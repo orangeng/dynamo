@@ -10,13 +10,13 @@ Package structure:
 - common/: Shared types and protocol (used by both server and client)
 - server/: Allocation server daemon (no CUDA context required)
 - client/: Client library for memory management
-  - client/torch/: PyTorch integration (lifecycle, tensor utilities, extensions)
+  - client/torch/: PyTorch integration (allocator, tensor, module, extensions)
 
 Primary client API:
     from gpu_memory_service import (
         GMSClientMemoryManager,
-        get_or_create_allocator,
-        get_allocator,
+        get_or_create_gms_client_memory_manager,
+        get_gms_client_memory_manager,
     )
 
 Server API:
@@ -26,20 +26,20 @@ Server API:
 # Primary client exports
 from gpu_memory_service.client.memory_manager import (
     GMSClientMemoryManager,
-    StaleWeightsError,
+    StaleMemoryLayoutError,
 )
 
-# PyTorch integration (lifecycle management)
-from gpu_memory_service.client.torch.lifecycle import (
-    get_allocator,
-    get_or_create_allocator,
+# PyTorch integration (GMS client memory manager)
+from gpu_memory_service.client.torch.allocator import (
+    get_gms_client_memory_manager,
+    get_or_create_gms_client_memory_manager,
 )
 
 __all__ = [
     # Client
     "GMSClientMemoryManager",
-    "StaleWeightsError",
-    # Lifecycle
-    "get_or_create_allocator",
-    "get_allocator",
+    "StaleMemoryLayoutError",
+    # GMS client memory manager
+    "get_or_create_gms_client_memory_manager",
+    "get_gms_client_memory_manager",
 ]

@@ -5,24 +5,24 @@
 
 This module provides PyTorch-specific functionality:
 
-- Lifecycle management (singleton allocator, MemPool setup)
+- Memory manager singleton management
 - Tensor utilities (metadata, registration, materialization)
-- C++ extensions (CUDAPluggableAllocator, tensor_from_pointer)
+- C++ extension for CUDAPluggableAllocator
 """
 
-from gpu_memory_service.client.torch.lifecycle import (
-    get_allocator,
-    get_or_create_allocator,
+from gpu_memory_service.client.torch.allocator import (
+    get_gms_client_memory_manager,
+    get_or_create_gms_client_memory_manager,
 )
-from gpu_memory_service.client.torch.tensor import (
+from gpu_memory_service.client.torch.module import (
     materialize_module_from_gms,
     register_module_tensors,
 )
 
 __all__ = [
-    # Lifecycle
-    "get_or_create_allocator",
-    "get_allocator",
+    # GMS client memory manager
+    "get_or_create_gms_client_memory_manager",
+    "get_gms_client_memory_manager",
     # Tensor operations (public API)
     "register_module_tensors",
     "materialize_module_from_gms",

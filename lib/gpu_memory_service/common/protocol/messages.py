@@ -1,19 +1,33 @@
 """Message types for GPU Memory Service RPC protocol."""
 
-from typing import Any, Dict, List, Literal, Optional, Union
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
 
 import msgspec
 
 
+class RequestedLockType(str, Enum):
+    """Lock type requested by client."""
+    RW = "rw"
+    RO = "ro"
+    RW_OR_RO = "rw_or_ro"
+
+
+class GrantedLockType(str, Enum):
+    """Lock type actually granted by server."""
+    RW = "rw"
+    RO = "ro"
+
+
 class HandshakeRequest(msgspec.Struct, tag="handshake_request"):
-    lock_type: Literal["rw", "ro", "rw_or_ro"]
+    lock_type: RequestedLockType
     timeout_ms: Optional[int] = None
 
 
 class HandshakeResponse(msgspec.Struct, tag="handshake_response"):
     success: bool
     committed: bool
-    granted_lock_type: Optional[Literal["rw", "ro"]] = None
+    granted_lock_type: Optional[GrantedLockType] = None
 
 
 class CommitRequest(msgspec.Struct, tag="commit_request"):
@@ -139,12 +153,12 @@ class MetadataListResponse(msgspec.Struct, tag="metadata_list_response"):
     keys: List[str] = []
 
 
-class GetStateHashRequest(msgspec.Struct, tag="get_state_hash_request"):
+class GetStateHashRequest(msgspec.Struct, tag="get_memory_layout_hash_request"):
     pass
 
 
-class GetStateHashResponse(msgspec.Struct, tag="get_state_hash_response"):
-    state_hash: str  # Hash of allocations + metadata, empty if not committed
+class GetStateHashResponse(msgspec.Struct, tag="get_memory_layout_hash_response"):
+    memory_layout_hash: str  # Hash of allocations + metadata, empty if not committed
 
 
 Message = Union[

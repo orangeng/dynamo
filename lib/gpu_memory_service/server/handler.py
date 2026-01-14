@@ -25,7 +25,7 @@ class RequestHandler:
     def __init__(self, device: int = 0):
         self._memory_manager = GMSServerMemoryManager(device)
         self._metadata: dict[str, MetadataEntry] = {}
-        self._state_hash: str = ""  # Hash of allocations + metadata, computed on commit
+        self._memory_layout_hash: str = ""  # Hash of allocations + metadata, computed on commit
         logger.info(f"RequestHandler initialized: device={device}")
 
     @property
@@ -37,14 +37,14 @@ class RequestHandler:
         logger.warning("RW aborted; clearing allocations and metadata")
         self._memory_manager.clear_all()
         self._metadata.clear()
-        self._state_hash = ""
+        self._memory_layout_hash = ""
 
     def on_commit(self) -> None:
         """Called when RW connection commits. Computes state hash."""
-        self._state_hash = self._compute_state_hash()
-        logger.info(f"Committed with state hash: {self._state_hash[:16]}...")
+        self._memory_layout_hash = self._compute_memory_layout_hash()
+        logger.info(f"Committed with state hash: {self._memory_layout_hash[:16]}...")
 
-    def _compute_state_hash(self) -> str:
+    def _compute_memory_layout_hash(self) -> str:
         """Compute hash of current allocations + metadata."""
         h = hashlib.sha256()
         # Hash allocations (sorted by ID for determinism)
@@ -158,11 +158,12 @@ class RequestHandler:
         return FreeResponse(success=success)
 
     def handle_clear_all(self) -> ClearAllResponse:
-        """Clear all allocations.
+        """Clear all allocations and metadata.
 
         Requires RW connection (enforced by server).
         """
         count = self._memory_manager.clear_all()
+        self._metadata.clear()
         return ClearAllResponse(cleared_count=count)
 
     # ==================== Metadata Operations ====================
@@ -189,5 +190,5 @@ class RequestHandler:
         keys = [k for k in self._metadata if k.startswith(req.prefix)] if req.prefix else list(self._metadata)
         return MetadataListResponse(keys=sorted(keys))
 
-    def handle_get_state_hash(self) -> GetStateHashResponse:
-        return GetStateHashResponse(state_hash=self._state_hash)
+    def handle_get_memory_layout_hash(self) -> GetStateHashResponse:
+        return GetStateHashResponse(memory_layout_hash=self._memory_layout_hash)

@@ -12,34 +12,32 @@ The core functionality is in the gpu_memory package; this module provides:
 # Re-export core functionality from gpu_memory_service package
 from gpu_memory_service import (
     GMSClientMemoryManager,
-    StaleWeightsError,
-    get_allocator,
-    get_or_create_allocator,
+    StaleMemoryLayoutError,
+    get_gms_client_memory_manager,
+    get_or_create_gms_client_memory_manager,
 )
 
 # Re-export extensions (built separately)
 from gpu_memory_service.client.torch.extensions import (
     _allocator_ext,
-    _tensor_from_pointer,
 )
 
-# Re-export tensor utilities
-from gpu_memory_service.client.torch.tensor import (
+# Re-export module utilities
+from gpu_memory_service.client.torch.module import (
     materialize_module_from_gms,
     register_module_tensors,
 )
 
 __all__ = [
-    # Core allocator
+    # Core
     "GMSClientMemoryManager",
-    "StaleWeightsError",
-    # Lifecycle management
-    "get_or_create_allocator",
-    "get_allocator",
+    "StaleMemoryLayoutError",
+    # GMS client memory manager
+    "get_or_create_gms_client_memory_manager",
+    "get_gms_client_memory_manager",
     # Tensor utilities
     "register_module_tensors",
     "materialize_module_from_gms",
     # Extensions
     "_allocator_ext",
-    "_tensor_from_pointer",
 ]

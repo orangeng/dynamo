@@ -65,10 +65,6 @@ sglang = [
     "nixl[cu12]<=0.8.0",
 ]
 
-gpu-memory-service = [
-    "gpu-memory-service @ file:lib/gpu_memory_service",
-]
-
 [project.entry-points.pytest11]
 vllm_tests = "dynamo.vllm.tests.conftest"
 trtllm_tests = "dynamo.trtllm.tests.conftest"

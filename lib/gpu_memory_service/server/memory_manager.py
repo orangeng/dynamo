@@ -61,7 +61,7 @@ class GMSServerMemoryManager:
     sharing with other processes.
 
     Key design points:
-    - No VA mapping: The manager never maps memory to virtual addresses,
+    - No VA mapping: The memory manager never maps memory to virtual addresses,
       so it doesn't create a CUDA context. This allows it to survive GPU
       driver failures.
     - NOT thread-safe: Callers must provide external synchronization.

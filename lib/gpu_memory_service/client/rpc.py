@@ -10,7 +10,7 @@ This module has NO PyTorch dependency.
 
 Usage:
     # Writer (acquires RW lock in constructor)
-    with GMSRPCClient(socket_path, lock_type="rw") as client:
+    with GMSRPCClient(socket_path, lock_type=RequestedLockType.RW) as client:
         alloc_id, aligned_size = client.allocate(size=1024*1024)
         fd = client.export(alloc_id)
         # ... write weights using fd ...
@@ -18,7 +18,7 @@ Usage:
     # Lock released on exit
 
     # Reader (acquires RO lock in constructor)
-    client = GMSRPCClient(socket_path, lock_type="ro")
+    client = GMSRPCClient(socket_path, lock_type=RequestedLockType.RO)
     if client.committed:  # Check if weights are valid
         allocations = client.list_allocations()
         for alloc in allocations:
@@ -34,7 +34,7 @@ from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
 from gpu_memory_service.common.protocol.messages import *  # noqa: F401,F403
 from gpu_memory_service.common.protocol.wire import *  # noqa: F401,F403
-from gpu_memory_service.common.types import RW_REQUIRED
+from gpu_memory_service.common.types import GrantedLockType, RequestedLockType, RW_REQUIRED
 
 T = TypeVar("T")
 
@@ -49,12 +49,12 @@ class GMSRPCClient:
     - close() releases the lock
     - committed property tells readers if weights are valid
 
-    For writers (lock_type="rw"):
+    For writers (lock_type=RequestedLockType.RW):
         - Use context manager (with statement) for automatic lock release
         - Call commit() after weights are written
         - Call clear_all() before loading new model
 
-    For readers (lock_type="ro"):
+    For readers (lock_type=RequestedLockType.RO):
         - Check committed property after construction
         - Keep connection open during inference lifetime
         - Only call close() when shutting down or allowing weight updates
@@ -63,14 +63,14 @@ class GMSRPCClient:
     def __init__(
         self,
         socket_path: str,
-        lock_type: str = "ro",
+        lock_type: RequestedLockType = RequestedLockType.RO,
         timeout_ms: Optional[int] = None,
     ):
         """Connect to Allocation Server and acquire lock.
 
         Args:
             socket_path: Path to server's Unix domain socket
-            lock_type: "rw" for writer, "ro" for reader
+            lock_type: Requested lock type (RW, RO, or RW_OR_RO)
             timeout_ms: Timeout in milliseconds for lock acquisition.
                         None means wait indefinitely.
 
@@ -83,7 +83,7 @@ class GMSRPCClient:
         self._socket: Optional[socket.socket] = None
         self._recv_buffer = bytearray()
         self._committed = False
-        self._granted_lock_type: Optional[str] = None  # Actual lock granted by server
+        self._granted_lock_type: Optional[GrantedLockType] = None
 
         # Connect and acquire lock
         self._connect(timeout_ms=timeout_ms)
@@ -126,11 +126,14 @@ class GMSRPCClient:
 
         self._committed = response.committed
         # Store granted lock type (may differ from requested for rw_or_ro mode)
-        self._granted_lock_type = (
-            response.granted_lock_type or self._requested_lock_type
-        )
+        if response.granted_lock_type is not None:
+            self._granted_lock_type = response.granted_lock_type
+        elif self._requested_lock_type == RequestedLockType.RW:
+            self._granted_lock_type = GrantedLockType.RW
+        else:
+            self._granted_lock_type = GrantedLockType.RO
         logger.info(
-            f"Connected with {self._requested_lock_type} lock (granted={self._granted_lock_type}), "
+            f"Connected with {self._requested_lock_type.value} lock (granted={self._granted_lock_type.value}), "
             f"committed={self._committed}"
         )
 
@@ -140,11 +143,10 @@ class GMSRPCClient:
         return self._committed
 
     @property
-    def lock_type(self) -> Optional[str]:
+    def lock_type(self) -> Optional[GrantedLockType]:
         """Get the lock type actually granted by the server.
 
         For rw_or_ro mode, this tells you whether RW or RO was granted.
-        Returns "rw" or "ro".
         """
         return self._granted_lock_type
 
@@ -170,7 +172,7 @@ class GMSRPCClient:
 
     def _call(self, request, response_type: Type[T]) -> T:
         """Send request, validate response type, return typed response."""
-        if type(request) in RW_REQUIRED and self.lock_type != "rw":
+        if type(request) in RW_REQUIRED and self.lock_type != GrantedLockType.RW:
             raise RuntimeError("Operation requires RW connection")
         response, _ = self._send_recv(request)
         if not isinstance(response, response_type):
@@ -188,7 +190,7 @@ class GMSRPCClient:
 
     def commit(self) -> bool:
         """Commit weights and release RW lock. Returns True on success."""
-        if CommitRequest in RW_REQUIRED and self.lock_type != "rw":
+        if CommitRequest in RW_REQUIRED and self.lock_type != GrantedLockType.RW:
             raise RuntimeError("Operation requires RW connection")
 
         try:
@@ -201,7 +203,7 @@ class GMSRPCClient:
             )
             self.close()
             try:
-                ro = GMSRPCClient(self.socket_path, lock_type="ro", timeout_ms=1000)
+                ro = GMSRPCClient(self.socket_path, lock_type=RequestedLockType.RO, timeout_ms=1000)
                 ok = ro.committed
                 ro.close()
             except TimeoutError:
@@ -256,9 +258,9 @@ class GMSRPCClient:
     def metadata_list(self, prefix: str = "") -> List[str]:
         return self._call(MetadataListRequest(prefix=prefix), MetadataListResponse).keys
 
-    def get_state_hash(self) -> str:
+    def get_memory_layout_hash(self) -> str:
         """Get state hash (hash of allocations + metadata). Empty if not committed."""
-        return self._call(GetStateHashRequest(), GetStateHashResponse).state_hash
+        return self._call(GetStateHashRequest(), GetStateHashResponse).memory_layout_hash
 
     def close(self) -> None:
         """Close connection and release lock."""
@@ -268,7 +270,8 @@ class GMSRPCClient:
             except Exception:
                 pass
             self._socket = None
-            logger.info(f"Closed {self.lock_type} connection")
+            lock_str = self.lock_type.value if self.lock_type else "unknown"
+            logger.info(f"Closed {lock_str} connection")
 
     def __enter__(self) -> "GMSRPCClient":
         """Context manager entry."""
