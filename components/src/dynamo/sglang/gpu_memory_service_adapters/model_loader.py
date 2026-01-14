@@ -264,7 +264,7 @@ class GPUServiceModelLoader:
         self, impl, model_config, device_config, config_hash: str
     ) -> torch.nn.Module:
         """Import weights from GMS (READ mode)."""
-        from gpu_memory_service.client.torch.tensor import materialize_module_from_gms
+        from gpu_memory_service.client.torch.module import materialize_module_from_gms
 
         from dynamo.sglang.gpu_memory_service_adapters.import_only_loader import (
             ImportOnlyModelLoader,
@@ -284,15 +284,14 @@ class GPUServiceModelLoader:
         )
 
         # Materialize weights from GMS
-        imported_bytes = materialize_module_from_gms(
+        materialize_module_from_gms(
             allocator,
             model,
-            prefix=f"{config_hash}:",
             device_index=impl.get_device_index(),
-            strict=True,
         )
 
         # Track bytes for memory accounting
+        imported_bytes = allocator.total_bytes
         impl.set_imported_weights_bytes(int(imported_bytes))
         GPUServiceModelLoader._imported_weights_bytes = int(imported_bytes)
 
@@ -323,8 +322,7 @@ class GPUServiceModelLoader:
                 "Allocator is None in WRITE mode - this should not happen"
             )
 
-        # Clear any stale metadata entries for this config
-        allocator.metadata_delete_prefix(f"{config_hash}:")
+        # Note: clear_all() is called at init time in RW mode, so no need to clear metadata here
 
         # Load model - allocations routed through region("weights") -> use_mem_pool()
         # The mempool context is already set up by ModelRunner.load_model() which wraps

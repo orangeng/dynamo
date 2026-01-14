@@ -143,32 +143,36 @@ class GPUMemoryServiceMemorySaverImpl:
     ) -> tuple[Optional["GMSClientMemoryManager"], Optional["MemPool"], str]:
         """Create allocator with automatic mode selection.
 
-        Uses "auto" mode which tries RW first, falls back to RO if weights
+        Uses RW_OR_RO mode which tries RW first, falls back to RO if weights
         are already committed. This enables automatic weight sharing.
 
         Returns:
             Tuple of (allocator, mem_pool, actual_mode). mem_pool is None for READ mode.
         """
-        from gpu_memory_service import get_or_create_allocator
+        from gpu_memory_service import get_or_create_gms_client_memory_manager
+        from gpu_memory_service.common.types import GrantedLockType, RequestedLockType
 
-        # Auto mode - use get_or_create_allocator to automatically select RW or RO
+        # Auto mode - use RW_OR_RO to automatically select RW or RO
         # First process gets RW and loads from disk, others get RO and import
-        allocator, mem_pool = get_or_create_allocator(
+        allocator, mem_pool = get_or_create_gms_client_memory_manager(
             self._socket_path,
             self._device_index,
-            mode="auto",  # Maps to rw_or_ro in lifecycle.py
+            mode=RequestedLockType.RW_OR_RO,
             tag="weights",
         )
-        actual_mode = allocator.mode  # "write" or "read" based on granted lock
-        if actual_mode == "write":
+        granted_mode = allocator.mode  # GrantedLockType.RW or GrantedLockType.RO
+        if granted_mode == GrantedLockType.RW:
             # Got RW lock - clear any stale state from previous runs
             allocator.clear_all()
+            actual_mode = "write"
+        else:
+            actual_mode = "read"
         logger.info(
             "[GPU Memory Service] Initialized in AUTO mode, granted=%s (device=%d)",
             actual_mode.upper(),
             self._device_index,
         )
-        return allocator, mem_pool if actual_mode == "write" else None, actual_mode
+        return allocator, mem_pool if granted_mode == GrantedLockType.RW else None, actual_mode
 
     def _is_weights_tag(self, tag: Optional[str]) -> bool:
         """Check if tag is for weights (handled by GPU Memory Service)."""
@@ -366,12 +370,11 @@ class GPUMemoryServiceMemorySaverImpl:
             )
 
         from gpu_memory_service.client.torch.extensions import _allocator_ext as cumem
-        from gpu_memory_service.client.torch.tensor import register_module_tensors
+        from gpu_memory_service.client.torch.module import register_module_tensors
 
         # Register tensors in the GMS metadata store
-        total_bytes = register_module_tensors(
-            self._allocator, model, metadata_prefix=f"{config_hash}:"
-        )
+        register_module_tensors(self._allocator, model)
+        total_bytes = self._allocator.total_bytes
         self._imported_weights_bytes = int(total_bytes)
 
         # Commit and switch to read mode
