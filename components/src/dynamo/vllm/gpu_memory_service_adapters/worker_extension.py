@@ -21,6 +21,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from gpu_memory_service.common.types import GrantedLockType, RequestedLockType
+
 if TYPE_CHECKING:
     from dynamo.gpu_memory_service import GMSClientMemoryManager
 
@@ -55,11 +57,11 @@ _original_load_model = None
 _original_init_device = None
 
 
-def get_gpu_memory_service_allocator() -> Optional["GMSClientMemoryManager"]:
-    """Get the GPU Memory Service allocator singleton."""
-    from dynamo.gpu_memory_service import get_allocator
+def get_gms_memory_manager() -> Optional["GMSClientMemoryManager"]:
+    """Get the GMS client memory manager singleton."""
+    from dynamo.gpu_memory_service import get_gms_client_memory_manager
 
-    return get_allocator()
+    return get_gms_client_memory_manager()
 
 
 def gpu_memory_service_sleep_weights() -> bool:
@@ -70,13 +72,13 @@ def gpu_memory_service_sleep_weights() -> bool:
 
     Returns True if sleep was performed.
     """
-    allocator = get_gpu_memory_service_allocator()
-    if allocator is None:
+    gms_client_memory_manager = get_gms_memory_manager()
+    if gms_client_memory_manager is None:
         return False
-    if allocator.is_sleeping:
+    if gms_client_memory_manager.is_sleeping:
         return False
     try:
-        allocator.sleep()
+        gms_client_memory_manager.sleep()
         logger.info("[GPU Memory Service] Slept GPU Memory Service weights (VA-stable)")
         return True
     except Exception as e:
@@ -95,23 +97,23 @@ def gpu_memory_service_wake_weights() -> bool:
     Returns True if wake was performed.
 
     Raises:
-        StaleWeightsError: If weights were structurally changed while sleeping.
+        StaleMemoryLayoutError: If memory layout was changed while sleeping.
     """
     import torch
 
-    allocator = get_gpu_memory_service_allocator()
-    if allocator is None:
+    gms_client_memory_manager = get_gms_memory_manager()
+    if gms_client_memory_manager is None:
         return False
-    if not allocator.is_sleeping:
+    if not gms_client_memory_manager.is_sleeping:
         return False
 
-    # Note: StaleWeightsError may propagate to caller
+    # Note: StaleMemoryLayoutError may propagate to caller
     # wake() sets the correct device context internally
-    allocator.wake()
+    gms_client_memory_manager.wake()
 
-    # Synchronize the allocator's device to ensure all remapping operations are visible
+    # Synchronize the manager's device to ensure all remapping operations are visible
     if torch.cuda.is_available():
-        device = allocator.device
+        device = gms_client_memory_manager.device
         torch.cuda.synchronize(device)
         logger.info(
             f"[GPU Memory Service] CUDA synchronized on device {device} after wake"
@@ -135,7 +137,7 @@ def _establish_early_gms_connection() -> bool:
     """
     try:
         import torch
-        from gpu_memory_service.client.torch.lifecycle import get_or_create_allocator
+        from gpu_memory_service.client.torch.allocator import get_or_create_gms_client_memory_manager
 
         # Get socket path from environment (set by main.py)
         socket_path_template = os.environ.get(
@@ -144,11 +146,11 @@ def _establish_early_gms_connection() -> bool:
         device = torch.cuda.current_device() if torch.cuda.is_available() else 0
         socket_path = socket_path_template.replace("{device}", str(device))
 
-        # Use auto mode - will get RW if available, RO if weights already committed
-        allocator, pool = get_or_create_allocator(
-            socket_path, device, mode="auto", tag="weights"
+        # Use RW_OR_RO mode - will get RW if available, RO if weights already committed
+        gms_client_memory_manager, pool = get_or_create_gms_client_memory_manager(
+            socket_path, device, mode=RequestedLockType.RW_OR_RO, tag="weights"
         )
-        granted_mode = allocator.mode
+        granted_mode = gms_client_memory_manager.mode
 
         logger.info(
             "[GPU Memory Service] Early connection established (socket=%s, device=%d, mode=%s)",
@@ -181,43 +183,43 @@ def _get_gpu_memory_service_committed_bytes() -> int:
     Returns 0 if:
     - GMS server not running or not in COMMITTED state
     - Allocator is in write mode (loading fresh weights)
-    - No allocator registered yet (shouldn't happen - init_device establishes it)
+    - No GMS client memory manager registered yet (shouldn't happen - init_device establishes it)
     - Query fails
     """
-    allocator = get_gpu_memory_service_allocator()
-    if allocator is None:
-        # No allocator registered - this shouldn't happen if init_device ran first
+    gms_client_memory_manager = get_gms_memory_manager()
+    if gms_client_memory_manager is None:
+        # No GMS client memory manager registered - this shouldn't happen if init_device ran first
         logger.debug(
-            "[GPU Memory ServicePatch] No allocator registered - no adjustment"
+            "[GPU Memory ServicePatch] No GMS client memory manager registered - no adjustment"
         )
         return 0
 
-    if allocator._client is None:
+    if gms_client_memory_manager._client is None:
         logger.debug(
-            "[GPU Memory ServicePatch] Allocator has no client - no adjustment"
+            "[GPU Memory ServicePatch] GMS client memory manager has no client - no adjustment"
         )
         return 0
 
-    if allocator.mode != "read":
+    if gms_client_memory_manager.mode != GrantedLockType.RO:
         # Write mode - no adjustment needed (loading fresh weights)
         logger.debug(
-            "[GPU Memory ServicePatch] Allocator in write mode - no adjustment needed"
+            "[GPU Memory ServicePatch] GMS client memory manager in write mode - no adjustment needed"
         )
         return 0
 
     try:
-        allocations = allocator._client.list_allocations()
+        allocations = gms_client_memory_manager._client.list_allocations()
         total_bytes = sum(alloc.get("aligned_size", 0) for alloc in allocations)
         if total_bytes > 0:
             logger.info(
-                "[GPU Memory ServicePatch] Queried committed bytes via allocator: "
+                "[GPU Memory ServicePatch] Queried committed bytes via GMS client memory manager: "
                 "%.2f GiB (%d allocations)",
                 total_bytes / (1 << 30),
                 len(allocations),
             )
         return total_bytes
     except Exception as e:
-        logger.debug("[GPU Memory ServicePatch] Failed to query via allocator: %s", e)
+        logger.debug("[GPU Memory ServicePatch] Failed to query via GMS client memory manager: %s", e)
         return 0
 
 
@@ -498,7 +500,7 @@ def patch_worker_sleep_wake() -> None:
                         "[GPU Memory Service] VA-stable woke GPU Memory Service weights"
                     )
             except Exception as e:
-                # StaleWeightsError or other - let it propagate
+                # StaleMemoryLayoutError or other - let it propagate
                 logger.error(
                     f"[GPU Memory Service] Failed to wake GPU Memory Service weights: {e}"
                 )
