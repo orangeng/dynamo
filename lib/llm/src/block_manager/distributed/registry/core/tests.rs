@@ -117,6 +117,13 @@ mod integration {
                             .encode_response(&ResponseType::Match(entries), &mut buf)
                             .unwrap();
                     }
+                    QueryType::Remove(keys) => {
+                        // Count how many keys would be removed (exist in storage)
+                        let removed_count = keys.iter().filter(|k| hub_storage.contains(k)).count();
+                        codec
+                            .encode_response(&ResponseType::Remove(removed_count), &mut buf)
+                            .unwrap();
+                    }
                 }
                 buf
             } else {

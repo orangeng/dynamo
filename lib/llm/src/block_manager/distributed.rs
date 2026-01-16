@@ -7,9 +7,14 @@ mod utils;
 mod zmq;
 
 mod leader;
+pub mod notifications;
 pub mod registry;
 mod worker;
 
+pub use notifications::{
+    CompletionChecker, NixlNotificationSender, NixlStatusChecker, RegisterTransferNotification,
+    TransferCompleteNotification, spawn_notification_handler,
+};
 pub use remote::{
     CanOffloadResult, PositionalRemoteHandle, RemoteHandle, RemoteHashOperations,
     RemoteHashOperationsSync, RemoteOperation,

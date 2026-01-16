@@ -4,6 +4,10 @@
 use super::events::EventManager;
 use super::*;
 use crate::block_manager::block::transfer::TransferContext;
+use crate::block_manager::distributed::notifications::{
+    NixlNotificationSender, NixlStatusChecker, RegisterTransferNotification,
+    RegistrationError, TransferCompleteNotification, spawn_notification_handler,
+};
 use dynamo_runtime::config::environment_names::kvbm::cpu_cache as env_cpu_cache;
 use dynamo_runtime::config::environment_names::kvbm::disk_cache as env_disk_cache;
 use prometheus::Registry;
@@ -352,6 +356,9 @@ pub struct RemoteTransferContext {
     base: Arc<TransferContext>,
     config: RemoteStorageConfig,
     worker_id: u64,
+    /// Sender for registering transfer completion notifications.
+    /// When set, transfers use async background polling instead of inline polling.
+    tx_notifications: Option<NixlNotificationSender>,
 }
 
 #[derive(Clone)]
@@ -362,6 +369,7 @@ pub struct RemoteContextConfig {
 
 impl RemoteTransferContext {
     pub fn for_object(base: Arc<TransferContext>, default_bucket: Option<String>) -> Self {
+        let tx = spawn_notification_handler(base.async_rt_handle());
         Self {
             base,
             config: RemoteStorageConfig::Object {
@@ -370,6 +378,7 @@ impl RemoteTransferContext {
                 region: None,
             },
             worker_id: 0,
+            tx_notifications: Some(tx),
         }
     }
 
@@ -380,6 +389,7 @@ impl RemoteTransferContext {
         region: Option<String>,
         worker_id: u64,
     ) -> Self {
+        let tx = spawn_notification_handler(base.async_rt_handle());
         Self {
             base,
             config: RemoteStorageConfig::Object {
@@ -388,22 +398,27 @@ impl RemoteTransferContext {
                 region,
             },
             worker_id,
+            tx_notifications: Some(tx),
         }
     }
 
     pub fn for_disk(base: Arc<TransferContext>, base_path: String, use_gds: bool) -> Self {
+        let tx = spawn_notification_handler(base.async_rt_handle());
         Self {
             base,
             config: RemoteStorageConfig::Disk { base_path, use_gds },
             worker_id: 0,
+            tx_notifications: Some(tx),
         }
     }
 
     pub fn new(base: Arc<TransferContext>, config: RemoteStorageConfig) -> Self {
+        let tx = spawn_notification_handler(base.async_rt_handle());
         Self {
             base,
             config,
             worker_id: 0,
+            tx_notifications: Some(tx),
         }
     }
 
@@ -444,6 +459,51 @@ impl RemoteTransferContext {
             RemoteStorageConfig::Disk { base_path, .. } => Some(base_path),
             _ => None,
         }
+    }
+
+    /// Register a NIXL transfer for async completion notification.
+    ///
+    /// Returns a `TransferCompleteNotification` that can be awaited to wait for
+    /// the transfer to complete. The transfer status is polled by a background
+    /// task instead of inline polling.
+    ///
+    /// # Errors
+    ///
+    /// Returns `(RegistrationError, XferRequest)` if registration fails. The caller
+    /// gets the `XferRequest` back so it can fall back to inline polling using
+    /// `agent.get_xfer_status()`.
+    pub fn register_nixl_transfer(
+        &self,
+        agent: &NixlAgent,
+        xfer_req: nixl_sys::XferRequest,
+    ) -> Result<TransferCompleteNotification, (RegistrationError, nixl_sys::XferRequest)> {
+        let tx = match self.tx_notifications.as_ref() {
+            Some(tx) => tx,
+            None => return Err((RegistrationError::HandlerNotAvailable, xfer_req)),
+        };
+
+        // Check channel capacity before moving xfer_req into notification
+        if tx.capacity() == 0 {
+            return Err((RegistrationError::ChannelUnavailable, xfer_req));
+        }
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let notification = RegisterTransferNotification {
+            uuid: uuid::Uuid::new_v4(),
+            checker: NixlStatusChecker::new(agent.clone(), xfer_req),
+            done: done_tx,
+        };
+
+        // This should succeed since we checked capacity above
+        tx.try_send(notification)
+            .expect("channel became unavailable between capacity check and send");
+
+        Ok(TransferCompleteNotification::new(done_rx))
+    }
+
+    /// Check if async notifications are available.
+    pub fn has_notification_handler(&self) -> bool {
+        self.tx_notifications.is_some()
     }
 }
 

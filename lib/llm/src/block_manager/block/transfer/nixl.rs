@@ -13,7 +13,38 @@ use nixl_sys::{
     XferStatus,
 };
 use std::future::Future;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+/// Poll transfer status inline with cancellation support.
+///
+/// This is the fallback path when async notification registration fails.
+/// Polls the agent for transfer status with a 1ms interval.
+async fn poll_transfer_completion_inline(
+    agent: &NixlAgent,
+    xfer_req: &XferRequest,
+    cancel_token: &CancellationToken,
+) -> Result<(), TransferError> {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(TransferError::Cancelled);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                match agent.get_xfer_status(xfer_req) {
+                    Ok(XferStatus::Success) => return Ok(()),
+                    Ok(XferStatus::InProgress) => continue,
+                    Err(e) => {
+                        return Err(TransferError::ExecutionError(
+                            format!("Transfer status check failed: {}", e)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn append_xfer_request<Source, Destination>(
     src: &Source,
     dst: &mut Destination,
@@ -346,7 +377,23 @@ where
 
     // Wait for completion with cancellation support
     if still_pending {
-        poll_transfer_completion(agent, &xfer_req, cancel_token).await?;
+        // Try async notification system, fall back to inline polling if unavailable
+        match ctx.register_nixl_transfer(agent, xfer_req) {
+            Ok(notification) => {
+                tokio::select! {
+                    result = notification => {
+                        result.map_err(|e| TransferError::ExecutionError(e.to_string()))?;
+                    }
+                    _ = cancel_token.cancelled() => {
+                        return Err(TransferError::Cancelled);
+                    }
+                }
+            }
+            Err((_, xfer_req)) => {
+                // Fall back to inline polling
+                poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
+            }
+        }
     }
 
     tracing::debug!(
@@ -365,7 +412,7 @@ async fn execute_disk_transfer<LB>(
     descriptors: &[RemoteBlockDescriptor],
     local_blocks: &[LB],
     block_size: usize,
-    _ctx: &RemoteTransferContext,
+    ctx: &RemoteTransferContext,
     cancel_token: &CancellationToken,
 ) -> Result<(), TransferError>
 where
@@ -463,7 +510,23 @@ where
 
     // Wait for completion with cancellation support
     if still_pending {
-        poll_transfer_completion(agent, &xfer_req, cancel_token).await?;
+        // Try async notification system, fall back to inline polling if unavailable
+        match ctx.register_nixl_transfer(agent, xfer_req) {
+            Ok(notification) => {
+                tokio::select! {
+                    result = notification => {
+                        result.map_err(|e| TransferError::ExecutionError(e.to_string()))?;
+                    }
+                    _ = cancel_token.cancelled() => {
+                        return Err(TransferError::Cancelled);
+                    }
+                }
+            }
+            Err((_, xfer_req)) => {
+                // Fall back to inline polling
+                poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
+            }
+        }
     }
 
     tracing::debug!(
@@ -473,41 +536,6 @@ where
     );
 
     Ok(())
-}
-
-/// Poll for transfer completion with cancellation support.
-async fn poll_transfer_completion(
-    agent: &NixlAgent,
-    xfer_req: &XferRequest,
-    cancel_token: &CancellationToken,
-) -> Result<(), TransferError> {
-    let poll_interval = tokio::time::Duration::from_micros(100);
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                return Err(TransferError::Cancelled);
-            }
-            _ = tokio::time::sleep(poll_interval) => {
-                let status = agent.get_xfer_status(xfer_req).map_err(|e| {
-                    TransferError::ExecutionError(format!("Failed to get transfer status: {:?}", e))
-                })?;
-
-                match status {
-                    XferStatus::Success => return Ok(()),
-                    XferStatus::InProgress => continue,
-                    // Handle other status values if they exist
-                    #[allow(unreachable_patterns)]
-                    other => {
-                        return Err(TransferError::ExecutionError(format!(
-                            "Transfer failed with status: {:?}",
-                            other
-                        )));
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(all(test, feature = "testing-cuda", feature = "testing-nixl"))]
