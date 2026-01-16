@@ -8,7 +8,6 @@ pub mod codec;
 pub mod error;
 pub mod events;
 pub mod eviction;
-pub mod gc;
 pub mod hub;
 pub mod hub_transport;
 pub mod key;
@@ -75,8 +74,3 @@ pub use events::{
     InProcessEventBus, RegistryEvent, StorageTier, StorageType,
 };
 
-// Garbage Collection
-pub use gc::{
-    DiskStorageLister, GarbageCollector, GcConfig, GcStats, ObjectStorageLister, RegistryLister,
-    StorageLister,
-};

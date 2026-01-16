@@ -29,7 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bincode::config;
+use tokio::io::AsyncWriteExt;
 
 /// Persisted entry in the registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,7 +273,7 @@ where
             self.snapshot_prefix, snapshot.sequence, timestamp
         );
 
-        let data = bincode::serialize(snapshot)?;
+        let data = bincode::serde::encode_to_vec(snapshot, config::standard())?;
         self.backend.write(&filename, &data).await?;
         self.ops_since_snapshot.store(0, Ordering::Release);
 
@@ -305,7 +306,8 @@ where
         // Get the latest snapshot (highest sequence number)
         let latest = snapshot_files.iter().max().unwrap();
         let data = self.backend.read(latest).await?;
-        let snapshot: RegistrySnapshot<K, V, M> = bincode::deserialize(&data)?;
+        let (snapshot, _): (RegistrySnapshot<K, V, M>, _) =
+            bincode::serde::decode_from_slice(&data, config::standard())?;
 
         tracing::info!(
             seq = snapshot.sequence,
@@ -381,7 +383,7 @@ where
         let seq = self.current_seq.fetch_add(1, Ordering::SeqCst);
 
         // Serialize with length prefix for safe recovery
-        let data = bincode::serialize(&entry)?;
+        let data = bincode::serde::encode_to_vec(&entry, config::standard())?;
         let mut buf = Vec::with_capacity(4 + data.len());
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&data);
@@ -415,8 +417,11 @@ where
                 break;
             }
 
-            match bincode::deserialize::<WalEntry<K, V, M>>(&data[pos..pos + len]) {
-                Ok(entry) => entries.push(entry),
+            match bincode::serde::decode_from_slice::<WalEntry<K, V, M>, _>(
+                &data[pos..pos + len],
+                config::standard(),
+            ) {
+                Ok((entry, _)) => entries.push(entry),
                 Err(e) => {
                     tracing::warn!("Failed to deserialize WAL entry at position {}: {}", pos, e);
                     break;
@@ -529,7 +534,7 @@ where
     /// Recover state from persistence.
     pub async fn recover(&self) -> Result<Option<RegistrySnapshot<K, V, M>>> {
         // Load latest snapshot
-        let mut snapshot = self.snapshot.load_latest().await?.unwrap_or_default();
+        let snapshot = self.snapshot.load_latest().await?.unwrap_or_default();
 
         // Replay WAL entries after snapshot
         let wal_entries = self.wal.replay().await?;

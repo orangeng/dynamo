@@ -370,6 +370,22 @@ where
                     warn!("Failed to encode response: {}", e);
                 }
             }
+            QueryType::Touch(keys) => {
+                // Touch is a no-op for now - just acknowledge
+                // Future: could update access timestamps for LRU eviction
+                let touched_count = keys.len();
+                debug!(
+                    query_type = "Touch",
+                    keys = ?keys,
+                    keys_count = touched_count,
+                    storage_size = storage.len(),
+                    "Query processed (no-op)"
+                );
+
+                if let Err(e) = codec.encode_response(&ResponseType::Touch(touched_count), &mut response) {
+                    warn!("Failed to encode response: {}", e);
+                }
+            }
         }
 
         response

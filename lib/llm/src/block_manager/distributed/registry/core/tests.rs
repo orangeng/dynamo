@@ -124,6 +124,12 @@ mod integration {
                             .encode_response(&ResponseType::Remove(removed_count), &mut buf)
                             .unwrap();
                     }
+                    QueryType::Touch(keys) => {
+                        // Touch is a no-op - just acknowledge
+                        codec
+                            .encode_response(&ResponseType::Touch(keys.len()), &mut buf)
+                            .unwrap();
+                    }
                 }
                 buf
             } else {
