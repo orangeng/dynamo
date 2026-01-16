@@ -667,6 +667,40 @@ class TestDeterminism:
         print(f"  Delay: {delay_seconds}s")
         print(f"  Max tokens: {max_tokens}")
 
+        # Establish baseline with warmup pattern
+        print("\n" + "=" * 70)
+        print("ESTABLISHING BASELINE (warmup -> clear cache -> baseline)")
+        print("=" * 70)
+
+        print("\nStep 1: Warmup request...")
+        try:
+            warmup_response = tester.make_request(
+                prompt, max_tokens=max_tokens, temperature=0.7, seed=42
+            )
+            print(f"Warmup response: {warmup_response}")
+        except Exception as e:
+            pytest.fail(f"Warmup request failed: {e}")
+
+        print("\nStep 2: Clearing cache...")
+        try:
+            tester.reset_prefix_cache()
+            print("Cache cleared successfully")
+        except Exception as e:
+            print(f"Warning: Cache reset failed: {e}")
+            print("Continuing without cache reset...")
+
+        print("\nStep 3: Baseline request (after cache clear)...")
+        try:
+            baseline_response = tester.make_request(
+                prompt, max_tokens=max_tokens, temperature=0.7, seed=42
+            )
+            print(f"Baseline response: {baseline_response}")
+        except Exception as e:
+            pytest.fail(f"Baseline request failed: {e}")
+
+        print("\n✓ Baseline established")
+        print("=" * 70)
+
         # Start vllm bench in background
         model = os.environ.get(
             "KVBM_MODEL_ID", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
@@ -753,11 +787,10 @@ class TestDeterminism:
 
             # Send same request repeatedly
             print(f"\n{'='*70}")
-            print(f"SENDING {num_requests} REQUESTS")
+            print(f"SENDING {num_requests} REQUESTS (comparing against baseline)")
             print(f"{'='*70}")
 
             responses = []
-            baseline_response = None  # Will be set from first response
             mismatches = []  # Track which requests had non-deterministic responses
 
             for i in range(num_requests):
@@ -831,23 +864,18 @@ class TestDeterminism:
                             f"Response: {response[:300]}"
                         )
 
-                    # Set first response as baseline
-                    if i == 0:
-                        baseline_response = response
-                        print("✓ Baseline set (request 1)")
+                    # Check determinism against baseline (established before benchmark)
+                    if response != baseline_response:
+                        print("✗ NON-DETERMINISTIC (differs from baseline)")
+                        mismatches.append(
+                            {
+                                "request_num": i + 1,
+                                "response": response,
+                                "baseline": baseline_response,
+                            }
+                        )
                     else:
-                        # From request 2 onwards, check determinism against baseline
-                        if response != baseline_response:
-                            print("NON-DETERMINISTIC (differs from baseline)")
-                            mismatches.append(
-                                {
-                                    "request_num": i + 1,
-                                    "response": response,
-                                    "baseline": baseline_response,
-                                }
-                            )
-                        else:
-                            print("Match with baseline")
+                        print("✓ Matches baseline")
 
                 except Exception as e:
                     print(f"Request failed: {e}")
