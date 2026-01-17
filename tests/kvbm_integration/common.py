@@ -675,7 +675,7 @@ class TestDeterminism:
         print("\nStep 1: Warmup request...")
         try:
             warmup_response = tester.make_request(
-                prompt, max_tokens=max_tokens, temperature=0.7, seed=42
+                prompt, max_tokens=max_tokens, temperature=0, seed=42
             )
             print(f"Warmup response: {warmup_response}")
         except Exception as e:
@@ -692,7 +692,7 @@ class TestDeterminism:
         print("\nStep 3: Baseline request (after cache clear)...")
         try:
             baseline_response = tester.make_request(
-                prompt, max_tokens=max_tokens, temperature=0.7, seed=42
+                prompt, max_tokens=max_tokens, temperature=0, seed=42
             )
             print(f"Baseline response: {baseline_response}")
         except Exception as e:
@@ -798,7 +798,7 @@ class TestDeterminism:
 
                 try:
                     response = tester.make_request(
-                        prompt, max_tokens=max_tokens, temperature=0.7, seed=42
+                        prompt, max_tokens=max_tokens, temperature=0, seed=42
                     )
                     responses.append(response)
                     print(f"Response: {response}")
