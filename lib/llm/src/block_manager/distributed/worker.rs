@@ -145,8 +145,13 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
 
         match agent.get_plugin_params("OBJ") {
             Ok((_, obj_params)) => match agent.create_backend("OBJ", &obj_params) {
-                Ok(_) => tracing::info!(worker_id = worker_id, "Created OBJ backend for object storage"),
-                Err(e) => tracing::warn!(worker_id = worker_id, error = %e, "Failed to create OBJ backend"),
+                Ok(_) => tracing::info!(
+                    worker_id = worker_id,
+                    "Created OBJ backend for object storage"
+                ),
+                Err(e) => {
+                    tracing::warn!(worker_id = worker_id, error = %e, "Failed to create OBJ backend")
+                }
             },
             Err(e) => tracing::warn!(worker_id = worker_id, error = %e, "OBJ plugin not available"),
         }
@@ -1003,7 +1008,8 @@ fn create_remote_context(
     use crate::block_manager::config::RemoteStorageConfig;
 
     // Get storage type preference
-    let storage_type = std::env::var("DYN_KVBM_REMOTE_STORAGE_TYPE").unwrap_or_else(|_| "auto".to_string());
+    let storage_type =
+        std::env::var("DYN_KVBM_REMOTE_STORAGE_TYPE").unwrap_or_else(|_| "auto".to_string());
     let storage_type = storage_type.to_lowercase();
 
     // Get object storage config
@@ -1066,7 +1072,7 @@ fn create_remote_context(
                 region: object_region,
             })
         }
-        "auto" | _ => {
+        _ => {
             // Auto-detect based on which env vars are set
             match (&bucket, &disk_path) {
                 (Some(_), Some(path)) => {

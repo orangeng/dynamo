@@ -332,6 +332,7 @@ where
 }
 
 /// Create a simple hub with HashMap storage and binary codec.
+#[allow(clippy::type_complexity)]
 pub fn simple_hub<K, V, M>()
 -> RegistryHub<K, V, M, super::storage::HashMapStorage<K, V>, super::codec::BinaryCodec<K, V, M>>
 where

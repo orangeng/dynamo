@@ -193,18 +193,18 @@ where
 
         leaves.retain(|e| &e.key != key);
 
-        if let Some(parent_key) = parent {
-            if let Some(parent_children) = children.get_mut(&parent_key) {
-                parent_children.remove(key);
-                if parent_children.is_empty() {
-                    children.remove(&parent_key);
-                    if let Some(&parent_depth) = depths.get(&parent_key) {
-                        leaves.insert(EvictionEntry {
-                            priority: -(parent_depth as i64),
-                            insertion_id: self.insertion_counter.fetch_add(1, Ordering::Relaxed),
-                            key: parent_key,
-                        });
-                    }
+        if let Some(parent_key) = parent
+            && let Some(parent_children) = children.get_mut(&parent_key)
+        {
+            parent_children.remove(key);
+            if parent_children.is_empty() {
+                children.remove(&parent_key);
+                if let Some(&parent_depth) = depths.get(&parent_key) {
+                    leaves.insert(EvictionEntry {
+                        priority: -(parent_depth as i64),
+                        insertion_id: self.insertion_counter.fetch_add(1, Ordering::Relaxed),
+                        key: parent_key,
+                    });
                 }
             }
         }

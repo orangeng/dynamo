@@ -292,6 +292,12 @@ mod tests {
         }
     }
 
+    impl CompletionChecker for std::sync::Arc<MockChecker> {
+        fn is_complete(&self) -> Result<bool> {
+            Ok(self.complete.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
     #[tokio::test]
     async fn test_immediate_completion() {
         let (tx, rx) = mpsc::channel(16);
@@ -321,12 +327,13 @@ mod tests {
         let handler = tokio::spawn(process_transfer_notifications(rx));
 
         let checker = std::sync::Arc::new(MockChecker::new(false));
-        let checker_clone = checker.clone();
+        let checker_for_notification = checker.clone();
+        let checker_for_task = checker.clone();
 
-        let (done_tx, done_rx) = oneshot::channel();
+        let (done_tx, _done_rx) = oneshot::channel();
         let notification = RegisterTransferNotification {
             uuid: Uuid::new_v4(),
-            checker: MockChecker::new(false),
+            checker: checker_for_notification,
             done: done_tx,
         };
 
@@ -335,15 +342,12 @@ mod tests {
         // Complete after a short delay
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            checker_clone.set_complete();
+            checker_for_task.set_complete();
         });
 
-        // Give time for completion - but this test uses a separate checker
-        // so we need to manually complete via the original
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Give time for completion
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // The test checker won't be set complete by the spawned task
-        // since they're different instances. Let's fix by dropping tx
         drop(tx);
         handler.await.unwrap();
     }
@@ -355,4 +359,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-

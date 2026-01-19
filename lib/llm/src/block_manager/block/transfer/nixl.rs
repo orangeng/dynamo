@@ -350,8 +350,14 @@ where
             let block_view = block.block_data().block_view()?;
             let addr = unsafe { block_view.as_ptr() as usize };
 
-            src_dl.add_desc(addr, block_size, 0); // device_id=0 for host
-            dst_dl.add_desc(0, block_size, desc.sequence_hash().unwrap());
+            src_dl.add_desc(addr, block_size, 0).map_err(|e| {
+                TransferError::ExecutionError(format!("Failed to add src desc: {e}"))
+            })?;
+            dst_dl
+                .add_desc(0, block_size, desc.sequence_hash().unwrap())
+                .map_err(|e| {
+                    TransferError::ExecutionError(format!("Failed to add dst desc: {e}"))
+                })?;
         }
 
         // Determine the transfer operation

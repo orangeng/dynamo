@@ -11,7 +11,7 @@ use dynamo_llm::{
             locality::LocalityProvider,
             transfer::remote::{DiskKey, ObjectKey, RemoteKey},
         },
-        config::{should_bypass_cpu_cache, RemoteStorageConfig},
+        config::{RemoteStorageConfig, should_bypass_cpu_cache},
         connector::protocol::{LeaderTransferRequest, RequestType, TransferType},
         distributed::{
             BlockTransferPool, BlockTransferRequest, KvbmLeader, RemoteHashOperations,
@@ -2342,9 +2342,7 @@ async fn process_remote_transfer_request(
     // Get storage configuration from leader
     let storage_config = leader.remote_storage_config().unwrap_or_else(|| {
         // Fallback to object storage with default bucket if not configured
-        tracing::warn!(
-            "No remote storage configured, falling back to default object storage"
-        );
+        tracing::warn!("No remote storage configured, falling back to default object storage");
         RemoteStorageConfig::Object {
             default_bucket: std::env::var("AWS_DEFAULT_BUCKET").ok(),
             endpoint: None,

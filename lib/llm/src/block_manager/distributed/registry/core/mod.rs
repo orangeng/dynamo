@@ -64,8 +64,8 @@ pub use zmq_hub::{ZmqHub, ZmqHubConfig as ZmqHubServerConfig};
 
 // Persistence
 pub use persistence::{
-    AccessStats, HybridPersistence, LocalDiskBackend, PersistenceBackend, PersistenceConfig,
-    PersistedEntry, RegistrySnapshot, SnapshotPersistence, WalEntry, WalPersistence,
+    AccessStats, HybridPersistence, LocalDiskBackend, PersistedEntry, PersistenceBackend,
+    PersistenceConfig, RegistrySnapshot, SnapshotPersistence, WalEntry, WalPersistence,
 };
 
 // Event Bus
@@ -73,4 +73,3 @@ pub use events::{
     EventBus, EventBusConfig, EventHandler, EventReceiver, EventTopic, EvictionReason,
     InProcessEventBus, RegistryEvent, StorageTier, StorageType,
 };
-

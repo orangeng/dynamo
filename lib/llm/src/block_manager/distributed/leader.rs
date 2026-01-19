@@ -191,8 +191,9 @@ impl KvbmLeader {
     /// - `DYN_KVBM_OBJECT_BUCKET` or `AWS_DEFAULT_BUCKET`: Bucket name for object storage
     /// - `DYN_KVBM_REMOTE_DISK_PATH`: Base path for disk storage
     /// - `DYN_KVBM_REMOTE_DISK_USE_GDS`: Enable GPU Direct Storage for disk (default: true)
-    pub fn remote_storage_config(&self) -> Option<crate::block_manager::config::RemoteStorageConfig>
-    {
+    pub fn remote_storage_config(
+        &self,
+    ) -> Option<crate::block_manager::config::RemoteStorageConfig> {
         use crate::block_manager::config::RemoteStorageConfig;
 
         let worker_id = self.config.rank;
@@ -234,7 +235,7 @@ impl KvbmLeader {
                 endpoint: object_endpoint,
                 region: object_region,
             }),
-            "auto" | _ => match (&bucket, &disk_path) {
+            _ => match (&bucket, &disk_path) {
                 (Some(_), Some(_)) | (Some(_), None) => Some(RemoteStorageConfig::Object {
                     default_bucket: bucket,
                     endpoint: object_endpoint,

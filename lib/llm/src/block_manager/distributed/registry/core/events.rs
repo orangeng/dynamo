@@ -330,10 +330,9 @@ impl EventBusConfig {
 
     /// Build an event bus from this configuration.
     pub fn build(&self) -> Box<dyn EventBus> {
-        match self.backend.as_str() {
-            "in_process" | _ => Box::new(InProcessEventBus::new(self.channel_capacity)),
-            // Future: Add ZMQ, NATS, Redis backends
-        }
+        // Future: Add ZMQ, NATS, Redis backends based on self.backend
+        let _ = self.backend.as_str(); // Reserved for future backend selection
+        Box::new(InProcessEventBus::new(self.channel_capacity))
     }
 }
 
@@ -410,5 +409,3 @@ mod tests {
         assert_eq!(handler.count.load(Ordering::Relaxed), 5);
     }
 }
-
-

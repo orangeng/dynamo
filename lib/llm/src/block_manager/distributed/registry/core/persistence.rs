@@ -5,22 +5,6 @@
 //!
 //! Provides snapshot and WAL-based persistence for crash recovery.
 //!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │                     HYBRID PERSISTENCE (RECOMMENDED)                     │
-//! │                                                                          │
-//! │   Mutation ──▶ Log to WAL ──▶ Apply ──▶ ACK                             │
-//! │       │                                                                  │
-//! │       └──▶ (every N ops) ──▶ Snapshot + Truncate WAL                    │
-//! │                                                                          │
-//! │   Recovery:                                                              │
-//! │   1. Load latest snapshot (fast)                                         │
-//! │   2. Replay WAL entries after snapshot (incremental)                     │
-//! │   3. Resume operation                                                    │
-//! └─────────────────────────────────────────────────────────────────────────┘
-//! ```
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use bincode::config;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 /// Persisted entry in the registry.
@@ -189,21 +173,34 @@ impl PersistenceBackend for LocalDiskBackend {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let search_path = self.full_path(prefix);
-        let search_dir = search_path
-            .parent()
-            .unwrap_or(&self.base_path)
-            .to_path_buf();
 
         let mut results = Vec::new();
 
-        if search_dir.exists() {
-            let mut entries = tokio::fs::read_dir(&search_dir).await?;
+        // If prefix is a directory, list its contents
+        if search_path.is_dir() {
+            let mut entries = tokio::fs::read_dir(&search_path).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if let Ok(relative) = path.strip_prefix(&self.base_path) {
-                    let path_str = relative.to_string_lossy().to_string();
-                    if path_str.starts_with(prefix) {
-                        results.push(path_str);
+                    results.push(relative.to_string_lossy().to_string());
+                }
+            }
+        } else {
+            // Otherwise, list files in parent that start with the prefix
+            let search_dir = search_path
+                .parent()
+                .unwrap_or(&self.base_path)
+                .to_path_buf();
+
+            if search_dir.exists() {
+                let mut entries = tokio::fs::read_dir(&search_dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    if let Ok(relative) = path.strip_prefix(&self.base_path) {
+                        let path_str = relative.to_string_lossy().to_string();
+                        if path_str.starts_with(prefix) {
+                            results.push(path_str);
+                        }
                     }
                 }
             }
@@ -404,16 +401,11 @@ where
         let mut pos = 0;
 
         while pos + 4 <= data.len() {
-            let len =
-                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+            let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
             pos += 4;
 
             if pos + len > data.len() {
-                tracing::warn!(
-                    "WAL truncated at position {} (expected {} bytes)",
-                    pos,
-                    len
-                );
+                tracing::warn!("WAL truncated at position {} (expected {} bytes)", pos, len);
                 break;
             }
 
@@ -431,12 +423,16 @@ where
         }
 
         // Update sequence counter
-        if let Some(last_seq) = entries.iter().filter_map(|e| Some(match e {
-            WalEntry::Register { seq, .. } => *seq,
-            WalEntry::Remove { seq, .. } => *seq,
-            WalEntry::Touch { seq, .. } => *seq,
-            WalEntry::Checkpoint { seq, .. } => *seq,
-        })).max() {
+        if let Some(last_seq) = entries
+            .iter()
+            .map(|e| match e {
+                WalEntry::Register { seq, .. } => *seq,
+                WalEntry::Remove { seq, .. } => *seq,
+                WalEntry::Touch { seq, .. } => *seq,
+                WalEntry::Checkpoint { seq, .. } => *seq,
+            })
+            .max()
+        {
             self.current_seq.store(last_seq + 1, Ordering::Release);
         }
 
@@ -737,5 +733,3 @@ mod tests {
         assert_eq!(entries.len(), 2);
     }
 }
-
-

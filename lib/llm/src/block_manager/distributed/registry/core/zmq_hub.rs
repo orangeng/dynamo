@@ -365,7 +365,8 @@ where
                     "Query processed"
                 );
 
-                if let Err(e) = codec.encode_response(&ResponseType::Remove(removed_count), &mut response)
+                if let Err(e) =
+                    codec.encode_response(&ResponseType::Remove(removed_count), &mut response)
                 {
                     warn!("Failed to encode response: {}", e);
                 }
@@ -382,7 +383,9 @@ where
                     "Query processed (no-op)"
                 );
 
-                if let Err(e) = codec.encode_response(&ResponseType::Touch(touched_count), &mut response) {
+                if let Err(e) =
+                    codec.encode_response(&ResponseType::Touch(touched_count), &mut response)
+                {
                     warn!("Failed to encode response: {}", e);
                 }
             }

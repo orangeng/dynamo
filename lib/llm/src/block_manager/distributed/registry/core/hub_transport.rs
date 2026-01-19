@@ -92,6 +92,7 @@ impl InProcessHubTransport {
 
 impl InProcessClientHandle {
     /// Send a query and wait for response.
+    #[allow(clippy::await_holding_lock)] // Lock must be held to ensure exclusive receiver access
     pub async fn request(&self, data: &[u8]) -> Result<Vec<u8>> {
         self.query_tx
             .send((self.client_id.clone(), data.to_vec()))

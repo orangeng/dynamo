@@ -5,8 +5,8 @@ use super::events::EventManager;
 use super::*;
 use crate::block_manager::block::transfer::TransferContext;
 use crate::block_manager::distributed::notifications::{
-    NixlNotificationSender, NixlStatusChecker, RegisterTransferNotification,
-    RegistrationError, TransferCompleteNotification, spawn_notification_handler,
+    NixlNotificationSender, NixlStatusChecker, RegisterTransferNotification, RegistrationError,
+    TransferCompleteNotification, spawn_notification_handler,
 };
 use dynamo_runtime::config::environment_names::kvbm::cpu_cache as env_cpu_cache;
 use dynamo_runtime::config::environment_names::kvbm::disk_cache as env_disk_cache;

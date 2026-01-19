@@ -187,10 +187,10 @@ where
                             !pending.is_empty() && pending.is_timed_out(timeout)
                         };
 
-                        if should_flush {
-                            if let Err(e) = client.flush().await {
-                                tracing::warn!(error = %e, "Batch flush failed");
-                            }
+                        if should_flush
+                            && let Err(e) = client.flush().await
+                        {
+                            tracing::warn!(error = %e, "Batch flush failed");
                         }
                     }
                 }
@@ -469,7 +469,7 @@ mod tests {
         // Count publishes in background
         let flush_counter = flush_count_clone;
         tokio::spawn(async move {
-            while let Some(_) = rx.recv().await {
+            while (rx.recv().await).is_some() {
                 flush_counter.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -503,7 +503,7 @@ mod tests {
         // Count publishes in background
         let flush_counter = flush_count_clone;
         tokio::spawn(async move {
-            while let Some(_) = rx.recv().await {
+            while (rx.recv().await).is_some() {
                 flush_counter.fetch_add(1, Ordering::SeqCst);
             }
         });

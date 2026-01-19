@@ -339,7 +339,7 @@ impl DiskStorage {
     /// * `size` - Size of the storage in bytes
     /// * `create` - If true, create the file (O_CREAT). If false, file must exist.
     /// * `persist` - If true, the file is NOT unlinked when DiskStorage is dropped.
-    ///               Use `true` for files that should outlive the DiskStorage instance.
+    ///   Use `true` for files that should outlive the DiskStorage instance.
     pub fn new_at_path(
         path: &str,
         size: usize,
@@ -350,15 +350,15 @@ impl DiskStorage {
         use nix::sys::stat::Mode;
 
         // Ensure parent directory exists
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    StorageError::AllocationFailed(format!(
-                        "Failed to create parent directory for {}: {}",
-                        path, e
-                    ))
-                })?;
-            }
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StorageError::AllocationFailed(format!(
+                    "Failed to create parent directory for {}: {}",
+                    path, e
+                ))
+            })?;
         }
 
         // Build open flags

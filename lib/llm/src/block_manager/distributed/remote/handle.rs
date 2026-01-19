@@ -305,7 +305,11 @@ where
     ) -> Result<usize, String> {
         match tokio::time::timeout(REGISTRY_TIMEOUT, registry.remove(&keys)).await {
             Ok(Ok(count)) => {
-                tracing::info!(removed = count, requested = keys.len(), "Registry remove complete");
+                tracing::info!(
+                    removed = count,
+                    requested = keys.len(),
+                    "Registry remove complete"
+                );
                 Ok(count)
             }
             Ok(Err(e)) => {
@@ -328,7 +332,11 @@ where
     ) -> Result<usize, String> {
         match tokio::time::timeout(REGISTRY_TIMEOUT, registry.touch(&keys)).await {
             Ok(Ok(count)) => {
-                tracing::debug!(touched = count, requested = keys.len(), "Registry touch complete");
+                tracing::debug!(
+                    touched = count,
+                    requested = keys.len(),
+                    "Registry touch complete"
+                );
                 Ok(count)
             }
             Ok(Err(e)) => {
@@ -461,10 +469,7 @@ where
 
         if self
             .tx
-            .send(RemoteOperation::Remove {
-                keys,
-                reply: None,
-            })
+            .send(RemoteOperation::Remove { keys, reply: None })
             .await
             .is_err()
         {
@@ -507,10 +512,7 @@ where
 
         if self
             .tx
-            .send(RemoteOperation::Touch {
-                keys,
-                reply: None,
-            })
+            .send(RemoteOperation::Touch { keys, reply: None })
             .await
             .is_err()
         {

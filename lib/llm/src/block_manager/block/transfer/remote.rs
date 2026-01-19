@@ -544,6 +544,7 @@ pub struct RemoteTransferHandle {
 }
 
 impl RemoteTransferHandle {
+    #[allow(dead_code)]
     pub(crate) fn new(
         completion: oneshot::Receiver<Result<(), TransferError>>,
         cancel_token: CancellationToken,
